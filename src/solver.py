@@ -445,3 +445,243 @@ def solve_network_intertemporal(Network: DistributionNetwork, R, B, dr, years, d
         "z": z_val,
         "P": P_val
     }
+
+
+# ------------------------------------------------------------
+# Stochastic (scenario-based) intertemporal model
+# ------------------------------------------------------------
+def solve_network_stochastic(Network: DistributionNetwork, R, B, dr, years, scenarios, OutputFlag=0):
+    """Solve a multi-year stochastic expansion model with shared investments and scenario-specific operations.
+
+    Args:
+        Network (DistributionNetwork): Base distribution network (static topology and costs).
+        R (float): Size of a single capacity reinforcement.
+        B (float or dict): Annual budget (scalar or dict {t: B_t}).
+        dr (float): Discount rate.
+        years (list[int]): List of year indices.
+        scenarios (dict): Mapping scenario_id -> {'prob': p, 'demands': {t: load_capacity dict}}.
+        OutputFlag (int): Gurobi output flag.
+
+    Returns:
+        dict: objective, per-year costs, decisions, and scenario-specific operations.
+    """
+    O = list(scenarios.keys())
+
+    # Sets
+    N = list(np.arange(1, len(Network.NODES)+1))
+    S = list(np.arange(1, len(Network.SUBSTATIONS)+1))
+    S_0 = [int(s.id[1:]) for s in Network.SUBSTATIONS if s.fix_cost == 0]
+    A = Network.A
+    E = Network.E
+    N_S = [int(sub.node[1:]) for sub in Network.SUBSTATIONS]
+    N_NS = np.delete(np.array(N), np.array(N_S)-1)
+
+    # Parameters
+    P = [s.capacity for s in Network.SUBSTATIONS]
+    C_S = [s.fix_cost for s in Network.SUBSTATIONS]
+    C_L = Network.edge_cost
+    C_R = [s.r_cost for s in Network.SUBSTATIONS]
+
+    # Demand vectors per scenario/year
+    d_to = {}
+    for o in O:
+        d_to[o] = {}
+        L_map = scenarios[o]['demands']
+        for t in years:
+            L = L_map[t]
+            d = np.zeros(len(Network.NODES))
+            for load, node in Network.loads_locations.items():
+                ind = int(node[1:]) - 1
+                d[ind] = L[load]
+            d_to[o][t] = d
+
+    model = gp.Model("Radial_Distribution_Network_Stochastic")
+
+    # Investment variables (scenario-invariant)
+    w = model.addVars(S, years, vtype=GRB.BINARY, name="w")
+    w_on = model.addVars(S, years, vtype=GRB.BINARY, name="w_on")
+    b = model.addVars([(i, j, s, t) for (i, j) in E for s in S for t in years],
+                      vtype=GRB.BINARY, name="b")
+    b_on = model.addVars([(i, j, s, t) for (i, j) in E for s in S for t in years],
+                         vtype=GRB.BINARY, name="b_on")
+    z = model.addVars(S, years, lb=0, vtype=GRB.INTEGER, name="z")
+
+    # Operational variables (scenario-specific)
+    y = model.addVars([(i, s, t, o) for i in N for s in S for t in years for o in O],
+                      vtype=GRB.BINARY, name="y")
+    x = model.addVars([(i, j, s, t, o) for (i, j) in A for s in S for t in years for o in O],
+                      vtype=GRB.BINARY, name="x")
+    f = model.addVars([(s, i, j, t, o) for s in S for (i, j) in A for t in years for o in O],
+                      lb=0.0, vtype=GRB.CONTINUOUS, name="f")
+    r = model.addVars([(s, t, o) for s in S for t in years for o in O],
+                      lb=0.0, vtype=GRB.CONTINUOUS, name="r")
+
+    # Activation monotonicity
+    for s in S:
+        first_t = years[0]
+        model.addConstr(w_on[s, first_t] == w[s, first_t], name=f"w_on_init_{s}")
+        if s in S_0:
+            model.addConstr(w[s, first_t] == 1, name=f"w0_fix_{s}")
+        for idx in range(1, len(years)):
+            t_prev = years[idx-1]
+            t_cur = years[idx]
+            model.addConstr(w[s, t_cur] >= w[s, t_prev], name=f"w_monotone_{s}_{t_cur}")
+            model.addConstr(w_on[s, t_cur] >= w[s, t_cur] - w[s, t_prev], name=f"w_on_diff_{s}_{t_cur}")
+            if s in S_0:
+                model.addConstr(w[s, t_cur] == 1, name=f"w_fix_{s}_{t_cur}")
+
+    # Line build monotonicity
+    for s in S:
+        for (i_u, j_u) in E:
+            first_t = years[0]
+            model.addConstr(b_on[i_u, j_u, s, first_t] == b[i_u, j_u, s, first_t], name=f"b_on_init_{s}_{i_u}_{j_u}")
+            for idx in range(1, len(years)):
+                t_prev = years[idx-1]
+                t_cur = years[idx]
+                model.addConstr(b[i_u, j_u, s, t_cur] >= b[i_u, j_u, s, t_prev], name=f"b_monotone_{s}_{i_u}_{j_u}_{t_cur}")
+                model.addConstr(b_on[i_u, j_u, s, t_cur] >= b[i_u, j_u, s, t_cur] - b[i_u, j_u, s, t_prev],
+                                name=f"b_on_diff_{s}_{i_u}_{j_u}_{t_cur}")
+
+    # Scenario-specific constraints
+    for o in O:
+        for t in years:
+            d = d_to[o][t]
+            M = float(np.sum(d))
+
+            model.addConstr(quicksum(r[s, t, o] for s in S) == np.sum(d), name=f"power_balance_{t}_{o}")
+
+            for n in N:
+                for s in S:
+                    model.addConstr(y[n, s, t, o] <= w[s, t], name=f"y_le_w_{n}_{s}_{t}_{o}")
+
+            for n in N_NS:
+                model.addConstr(quicksum(y[n, s, t, o] for s in S) == 1, name=f"assign_{n}_{t}_{o}")
+
+            for s in S:
+                node_idx = N_S[s-1]
+                model.addConstr(y[node_idx, s, t, o] == w[s, t], name=f"substation_assign_{s}_{t}_{o}")
+                for s2 in S:
+                    if s2 != s:
+                        model.addConstr(y[node_idx, s2, t, o] == 0, name=f"substation_no_assign_{s}_{s2}_{t}_{o}")
+
+            for s in S:
+                model.addConstr(r[s, t, o] == quicksum(d[n-1] * y[n, s, t, o] for n in N),
+                                name=f"supply_def_{s}_{t}_{o}")
+
+            for s in S:
+                cap = P[s-1] + R * quicksum(z[s, tau] for tau in years if tau <= t)
+                model.addConstr(r[s, t, o] <= cap * w[s, t], name=f"capacity_{s}_{t}_{o}")
+
+            for s in S:
+                model.addConstr(w[s, t] <= quicksum(x[i, j, s, t, o] for (i, j) in A),
+                                name=f"feeder_{s}_{t}_{o}")
+
+            for s in S:
+                for n in N:
+                    incoming = quicksum(f[s, j, n, t, o] for (j, k) in A if k == n)
+                    outgoing = quicksum(f[s, n, j, t, o] for (k, j) in A if k == n)
+                    if n == N_S[s-1]:
+                        model.addConstr(outgoing - incoming == r[s, t, o], name=f"flow_balance_sub_{s}_{n}_{t}_{o}")
+                    elif n in N_NS:
+                        model.addConstr(outgoing - incoming == -d[n-1] * y[n, s, t, o],
+                                        name=f"flow_balance_{s}_{n}_{t}_{o}")
+
+            for s in S:
+                for (i, j) in A:
+                    model.addConstr(f[s, i, j, t, o] <= M * x[i, j, s, t, o], name=f"f_cap_{s}_{i}_{j}_{t}_{o}")
+                    e = (min(i, j), max(i, j))
+                    model.addConstr(x[i, j, s, t, o] <= b[e[0], e[1], s, t], name=f"x_le_b_{s}_{i}_{j}_{t}_{o}")
+
+            for s in S:
+                for n in N_NS:
+                    model.addConstr(quicksum(x[j, n, s, t, o] for (j, k) in A if k == n) == y[n, s, t, o],
+                                    name=f"one_parent_{s}_{n}_{t}_{o}")
+                node_idx = N_S[s-1]
+                model.addConstr(quicksum(x[j, node_idx, s, t, o] for (j, k) in A if k == node_idx) == 0,
+                                name=f"parent_root_{s}_{t}_{o}")
+                for (k, j) in A:
+                    if k == node_idx:
+                        model.addConstr(
+                            quicksum(x[k, j, s2, t, o] for s2 in S if s2 != s) <= (1 - y[node_idx, s, t, o]),
+                            name=f"root_arc_ass_s{s}_arc{node_idx}_{j}_{t}_{o}")
+            for s in S:
+                model.addConstr(quicksum(x[i, j, s, t, o] for (i, j) in A) ==
+                                quicksum(y[n, s, t, o] for n in N) - w[s, t],
+                                name=f"tree_size_{s}_{t}_{o}")
+
+        # Budget per year (investment only, scenario-invariant)
+    for t in years:
+        budget_t = B[t] if isinstance(B, dict) else B
+        fix_term_t = quicksum(C_S[s-1] * w_on[s, t] for s in S)
+        edge_term_t = quicksum(C_L[(i, j)] * b_on[i, j, s, t] for (i, j) in E for s in S)
+        reinf_term_t = quicksum(C_R[s-1] * z[s, t] for s in S)
+        model.addConstr(fix_term_t + edge_term_t + reinf_term_t <= budget_t, name=f"budget_{t}")
+
+    # Objective: expected (investments are scenario-invariant so prob factor optional)
+    objective = quicksum(
+        (quicksum(C_S[s-1] * w_on[s, t] for s in S) +
+         quicksum(C_L[(i, j)] * b_on[i, j, s, t] for (i, j) in E for s in S) +
+         quicksum(C_R[s-1] * z[s, t] for s in S)) / ((1 + dr) ** (t - 1))
+        for t in years
+    )
+    model.setObjective(objective, GRB.MINIMIZE)
+
+    model.setParam('OutputFlag', OutputFlag)
+    model.optimize()
+
+    if model.status == GRB.INFEASIBLE:
+        raise Exception("Stochastic model is infeasible. Check budgets/demands.")
+
+    # Extract results
+    w_val = {(s, t): w[s, t].X for s in S for t in years}
+    w_on_val = {(s, t): w_on[s, t].X for s in S for t in years}
+    b_val = {(i, j, s, t): b[i, j, s, t].X for (i, j) in E for s in S for t in years}
+    b_on_val = {(i, j, s, t): b_on[i, j, s, t].X for (i, j) in E for s in S for t in years}
+    z_val = {(s, t): z[s, t].X for s in S for t in years}
+
+    y_val = {(i, s, t, o): y[i, s, t, o].X for i in N for s in S for t in years for o in O}
+    x_val = {(i, j, s, t, o): x[i, j, s, t, o].X for (i, j) in A for s in S for t in years for o in O}
+    f_val = {(s, i, j, t, o): f[s, i, j, t, o].X for s in S for (i, j) in A for t in years for o in O}
+    r_val = {(s, t, o): r[s, t, o].X for s in S for t in years for o in O}
+
+    P_val = {(s, t): (P[s-1] + R * sum(z_val[s, tau] for tau in years if tau <= t)) * w_val[s, t]
+             for s in S for t in years}
+
+    cost_per_year = {}
+    cost_per_year_nominal = {}
+    cost_components_nominal = {}
+    cost_components_discounted = {}
+    for t in years:
+        fix_term_t = sum(C_S[s-1] * w_on_val[s, t] for s in S)
+        edge_term_t = sum(C_L[(i, j)] * b_on_val[i, j, s, t] for (i, j) in E for s in S)
+        reinf_term_t = sum(C_R[s-1] * z_val[s, t] for s in S)
+        cost_per_year[t] = (fix_term_t + edge_term_t + reinf_term_t) / ((1 + dr) ** (t - 1))
+        cost_per_year_nominal[t] = fix_term_t + edge_term_t + reinf_term_t
+        cost_components_nominal[t] = {
+            "substation": fix_term_t,
+            "lines": edge_term_t,
+            "reinforcement": reinf_term_t
+        }
+        cost_components_discounted[t] = {
+            "substation": fix_term_t / ((1 + dr) ** (t - 1)),
+            "lines": edge_term_t / ((1 + dr) ** (t - 1)),
+            "reinforcement": reinf_term_t / ((1 + dr) ** (t - 1)),
+        }
+
+    return {
+        "objective": model.ObjVal,
+        "cost_per_year": cost_per_year,
+        "cost_per_year_nominal": cost_per_year_nominal,
+        "cost_components_nominal": cost_components_nominal,
+        "cost_components_discounted": cost_components_discounted,
+        "w": w_val,
+        "w_on": w_on_val,
+        "b": b_val,
+        "b_on": b_on_val,
+        "z": z_val,
+        "P": P_val,
+        "y": y_val,
+        "x": x_val,
+        "f": f_val,
+        "r": r_val
+    }
