@@ -101,7 +101,7 @@ class DistributionNetwork():
 
     def update_initial_conditions(self, w: dict, x: dict, z: dict, R, OutputFlag=True):
         """
-        Used in Model 1 (single-period optimization).
+        Used in Model 1 to display updates. (and update the class additionally)
 
         Attributes:
             w (dict): Dictionary of substations activation variables from previous solution.

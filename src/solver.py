@@ -4,15 +4,13 @@ from gurobipy import GRB, quicksum
 
 from src.classes import DistributionNetwork
 
-def solve_network(Network: DistributionNetwork, R, B, dr, Y, OutputFlag=0):
+def solve_network(Network: DistributionNetwork, R, B, OutputFlag=0):
     """Solves a Distribution Network expansion problem.
 
     Args:
         Network (DistributionNetwork): Defined Distribution Network.
         R (float): Size of a single capacity reinforcement.
-        B (float): Annual budget (nominal value).
-        dr (float): Discount rate.
-        Y (int): Year (ONLY FOR MODEL 1). Used for cost discounting.
+        B (float): Budget (nominal value).
         OutputFlag (int, optional): Display solver output. Defaults to 0.
 
     Returns:
@@ -49,8 +47,6 @@ def solve_network(Network: DistributionNetwork, R, B, dr, Y, OutputFlag=0):
     C_R = [s.r_cost for s in Network.SUBSTATIONS]       # Cost of capacity reinforcement
     # R from the function arguments                     # Size of a single capacity reinforcement
     # B ...                                             # Annual budget
-    # dr ...                                            # Discount rate
-    # Y ...                                             # Year (only in single-period Model 1)
     M = float(np.sum(d))                                # Big-M used to constraint power flow
 
     #   Model. Decision variables
@@ -154,12 +150,12 @@ def solve_network(Network: DistributionNetwork, R, B, dr, Y, OutputFlag=0):
     fix_term = quicksum(C_S[s-1] * w[s] for s in S)
     edge_term = quicksum(C_L[(min(i,j),max(i,j))] * x[i,j,s] for (i,j) in A for s in S)
     reinf_term = quicksum(C_R[s-1] * z[s] for s in S)
-    model.addConstr(fix_term + edge_term + reinf_term <= B, name=f"budget_{Y}") # Nominal prices
+    model.addConstr(fix_term + edge_term + reinf_term <= B, name=f"budget") # Nominal prices
 
     #   Model. Objective function
     #   min f(x) = substation cost + feeder cost + capacity reinforcement cost
 
-    model.setObjective((fix_term + edge_term + reinf_term)/(1+dr)**(Y-1), GRB.MINIMIZE)
+    model.setObjective(fix_term + edge_term + reinf_term, GRB.MINIMIZE)
 
     # ------------------------
     #   Solve
@@ -171,9 +167,6 @@ def solve_network(Network: DistributionNetwork, R, B, dr, Y, OutputFlag=0):
     if model.status == GRB.INFEASIBLE:
         raise Exception("Model is infeasible. Check budget constraints.")
     else:
-        cost_val = (sum(C_S[s-1] * w[s].X for s in S) 
-                    + sum(C_L[(min(i,j), max(i,j))] * x[i,j,s].X for (i,j) in A for s in S)
-                    + sum(C_R[s-1] * z[s].X for s in S))
         w_val = {s: w[s].X for s in S}
         y_val = {(i, s): y[i, s].X for i in N for s in S}
         x_val = {(i, j, s): x[i, j, s].X for (i, j) in A for s in S}
@@ -184,8 +177,7 @@ def solve_network(Network: DistributionNetwork, R, B, dr, Y, OutputFlag=0):
 
     # Return numerical data
     return {
-            "objective": model.ObjVal,  # Discounted cost
-            "cost": cost_val,
+            "objective": model.ObjVal,  # Cost
             "w": w_val,
             "y": y_val,
             "x": x_val,
@@ -200,8 +192,7 @@ def print_results(Network, solution, detailed=False):
     N = list(np.arange(1, len(Network.NODES)+1))  # [1,2,3,4]
     S = list(np.arange(1, len(Network.SUBSTATIONS)+1))  # [1,2]
     print("System demand:", round(sum(Network.load_capacity.values()),2))
-    print("Total cost (nominal):", solution['cost'])
-    print("Total discounted cost:", round(solution['objective'], 2))
+    print("Total cost (nominal):", round(solution['objective'], 2))
 
     print("\nSubstation activation and supply:")
     for s in S:
