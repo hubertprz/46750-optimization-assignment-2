@@ -375,6 +375,7 @@ def solve_network_intertemporal(Network: DistributionNetwork, R, B, dr, years, d
 
     # Extract results
     w_val = {(s, t): w[s, t].X for s in S for t in years}
+    w_on_val = {(s, t): w_on[s, t].X for s in S for t in years}
     y_val = {(i, s, t): y[i, s, t].X for i in N for s in S for t in years}
     x_val = {(i, j, s, t): x[i, j, s, t].X for (i, j) in A for s in S for t in years}
     f_val = {(s, i, j, t): f[s, i, j, t].X for s in S for (i, j) in A for t in years}
@@ -383,9 +384,19 @@ def solve_network_intertemporal(Network: DistributionNetwork, R, B, dr, years, d
     P_val = {(s, t): (P[s-1] + R * sum(z_val[s, tau] for tau in years if tau <= t)) * w_val[s, t]
              for s in S for t in years}
 
+    # Per-year discounted costs (aligns with objective)
+    cost_per_year = {}
+    for t in years:
+        fix_term_t = sum(C_S[s-1] * w_on_val[s, t] for s in S)
+        edge_term_t = sum(C_L[(min(i, j), max(i, j))] * x_val[i, j, s, t] for (i, j) in A for s in S)
+        reinf_term_t = sum(C_R[s-1] * z_val[s, t] for s in S)
+        cost_per_year[t] = (fix_term_t + edge_term_t + reinf_term_t) / ((1 + dr) ** (t - 1))
+
     return {
         "objective": model.ObjVal,
+        "cost_per_year": cost_per_year,
         "w": w_val,
+        "w_on": w_on_val,
         "y": y_val,
         "x": x_val,
         "f": f_val,
