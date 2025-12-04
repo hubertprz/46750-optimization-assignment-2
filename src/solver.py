@@ -258,6 +258,11 @@ def solve_network_intertemporal(Network: DistributionNetwork, R, B, dr, years, d
     # Decision variables (time-indexed)
     w = model.addVars(S, years, vtype=GRB.BINARY, name="w")  # activation (can stay on across years)
     w_on = model.addVars(S, years, vtype=GRB.BINARY, name="w_on")  # activation event (costed once)
+    # Line build status (undirected edge) and use (directed arc)
+    b = model.addVars([(min(i, j), max(i, j), s, t) for (i, j) in Network.E for s in S for t in years],
+                      vtype=GRB.BINARY, name="b")  # built status (monotone)
+    b_on = model.addVars([(min(i, j), max(i, j), s, t) for (i, j) in Network.E for s in S for t in years],
+                         vtype=GRB.BINARY, name="b_on")  # build event (costed once)
     y = model.addVars([(i, s, t) for i in N for s in S for t in years], vtype=GRB.BINARY, name="y")
     x = model.addVars([(i, j, s, t) for (i, j) in A for s in S for t in years], vtype=GRB.BINARY, name="x")
     z = model.addVars(S, years, lb=0, vtype=GRB.INTEGER, name="z")
@@ -278,6 +283,18 @@ def solve_network_intertemporal(Network: DistributionNetwork, R, B, dr, years, d
             model.addConstr(w_on[s, t_cur] >= w[s, t_cur] - w[s, t_prev], name=f"w_on_diff_{s}_{t_cur}")
             if s in S_0:
                 model.addConstr(w[s, t_cur] == 1, name=f"w_fix_{s}_{t_cur}")
+
+    # Line build monotonicity and linking to use (pay once)
+    for s in S:
+        for (i_u, j_u) in Network.E:
+            first_t = years[0]
+            model.addConstr(b_on[i_u, j_u, s, first_t] == b[i_u, j_u, s, first_t], name=f"b_on_init_{s}_{i_u}_{j_u}")
+            for idx in range(1, len(years)):
+                t_prev = years[idx-1]
+                t_cur = years[idx]
+                model.addConstr(b[i_u, j_u, s, t_cur] >= b[i_u, j_u, s, t_prev], name=f"b_monotone_{s}_{i_u}_{j_u}_{t_cur}")
+                model.addConstr(b_on[i_u, j_u, s, t_cur] >= b[i_u, j_u, s, t_cur] - b[i_u, j_u, s, t_prev],
+                                name=f"b_on_diff_{s}_{i_u}_{j_u}_{t_cur}")
 
     # Constraints per year
     for t in years:
@@ -332,6 +349,9 @@ def solve_network_intertemporal(Network: DistributionNetwork, R, B, dr, years, d
         for s in S:
             for (i, j) in A:
                 model.addConstr(f[s, i, j, t] <= M * x[i, j, s, t], name=f"f_cap_{s}_{i}_{j}_{t}")
+                # Arc use only if edge built
+                e = (min(i, j), max(i, j))
+                model.addConstr(x[i, j, s, t] <= b[e[0], e[1], s, t], name=f"x_le_b_{s}_{i}_{j}_{t}")
 
         # Radiality and tree size
         for s in S:
@@ -354,14 +374,14 @@ def solve_network_intertemporal(Network: DistributionNetwork, R, B, dr, years, d
         # Budget per year
         budget_t = B[t] if isinstance(B, dict) else B
         fix_term_t = quicksum(C_S[s-1] * w_on[s, t] for s in S)
-        edge_term_t = quicksum(C_L[(min(i, j), max(i, j))] * x[i, j, s, t] for (i, j) in A for s in S)
+        edge_term_t = quicksum(C_L[(i, j)] * b_on[i, j, s, t] for (i, j) in Network.E for s in S)
         reinf_term_t = quicksum(C_R[s-1] * z[s, t] for s in S)
         model.addConstr(fix_term_t + edge_term_t + reinf_term_t <= budget_t, name=f"budget_{t}")
 
     # Objective: discounted cost over years
     objective = quicksum(
         (quicksum(C_S[s-1] * w_on[s, t] for s in S) +
-         quicksum(C_L[(min(i, j), max(i, j))] * x[i, j, s, t] for (i, j) in A for s in S) +
+         quicksum(C_L[(i, j)] * b_on[i, j, s, t] for (i, j) in Network.E for s in S) +
          quicksum(C_R[s-1] * z[s, t] for s in S)) / ((1 + dr) ** (t - 1))
         for t in years
     )
@@ -383,23 +403,41 @@ def solve_network_intertemporal(Network: DistributionNetwork, R, B, dr, years, d
     z_val = {(s, t): z[s, t].X for s in S for t in years}
     P_val = {(s, t): (P[s-1] + R * sum(z_val[s, tau] for tau in years if tau <= t)) * w_val[s, t]
              for s in S for t in years}
+    b_val = {(i, j, s, t): b[i, j, s, t].X for (i, j) in Network.E for s in S for t in years}
+    b_on_val = {(i, j, s, t): b_on[i, j, s, t].X for (i, j) in Network.E for s in S for t in years}
 
     # Per-year discounted costs (aligns with objective)
     cost_per_year = {}
     cost_per_year_nominal = {}
+    cost_components_nominal = {}
+    cost_components_discounted = {}
     for t in years:
         fix_term_t = sum(C_S[s-1] * w_on_val[s, t] for s in S)
-        edge_term_t = sum(C_L[(min(i, j), max(i, j))] * x_val[i, j, s, t] for (i, j) in A for s in S)
+        edge_term_t = sum(C_L[(i, j)] * b_on_val[i, j, s, t] for (i, j) in Network.E for s in S)
         reinf_term_t = sum(C_R[s-1] * z_val[s, t] for s in S)
         cost_per_year[t] = (fix_term_t + edge_term_t + reinf_term_t) / ((1 + dr) ** (t - 1))
         cost_per_year_nominal[t] = fix_term_t + edge_term_t + reinf_term_t
+        cost_components_nominal[t] = {
+            "substation": fix_term_t,
+            "lines": edge_term_t,
+            "reinforcement": reinf_term_t
+        }
+        cost_components_discounted[t] = {
+            "substation": fix_term_t / ((1 + dr) ** (t - 1)),
+            "lines": edge_term_t / ((1 + dr) ** (t - 1)),
+            "reinforcement": reinf_term_t / ((1 + dr) ** (t - 1)),
+        }
 
     return {
         "objective": model.ObjVal,
         "cost_per_year": cost_per_year,
         "cost_per_year_nominal": cost_per_year_nominal,
+        "cost_components_nominal": cost_components_nominal,
+        "cost_components_discounted": cost_components_discounted,
         "w": w_val,
         "w_on": w_on_val,
+        "b": b_val,
+        "b_on": b_on_val,
         "y": y_val,
         "x": x_val,
         "f": f_val,
