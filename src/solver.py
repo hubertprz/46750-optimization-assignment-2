@@ -386,15 +386,18 @@ def solve_network_intertemporal(Network: DistributionNetwork, R, B, dr, years, d
 
     # Per-year discounted costs (aligns with objective)
     cost_per_year = {}
+    cost_per_year_nominal = {}
     for t in years:
         fix_term_t = sum(C_S[s-1] * w_on_val[s, t] for s in S)
         edge_term_t = sum(C_L[(min(i, j), max(i, j))] * x_val[i, j, s, t] for (i, j) in A for s in S)
         reinf_term_t = sum(C_R[s-1] * z_val[s, t] for s in S)
         cost_per_year[t] = (fix_term_t + edge_term_t + reinf_term_t) / ((1 + dr) ** (t - 1))
+        cost_per_year_nominal[t] = fix_term_t + edge_term_t + reinf_term_t
 
     return {
         "objective": model.ObjVal,
         "cost_per_year": cost_per_year,
+        "cost_per_year_nominal": cost_per_year_nominal,
         "w": w_val,
         "w_on": w_on_val,
         "y": y_val,
