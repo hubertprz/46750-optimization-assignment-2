@@ -214,7 +214,7 @@ def print_results(Network, solution, detailed=False):
 # ------------------------------------------------------------
 # Intertemporal (multi-year) extension of the network problem
 # ------------------------------------------------------------
-def solve_network_intertemporal(Network: DistributionNetwork, R, B, dr, years, demands, OutputFlag=0):
+def solve_network_intertemporal(Network: DistributionNetwork, R, B, dr, years, demands, op_cost=0.0, OutputFlag=0):
     """Solve a multi-year deterministic expansion model in one optimization.
 
     Args:
@@ -382,7 +382,8 @@ def solve_network_intertemporal(Network: DistributionNetwork, R, B, dr, years, d
     objective = quicksum(
         (quicksum(C_S[s-1] * w_on[s, t] for s in S) +
          quicksum(C_L[(i, j)] * b_on[i, j, s, t] for (i, j) in Network.E for s in S) +
-         quicksum(C_R[s-1] * z[s, t] for s in S)) / ((1 + dr) ** (t - 1))
+         quicksum(C_R[s-1] * z[s, t] for s in S) +
+         op_cost * np.sum(d_t[t])) / ((1 + dr) ** (t - 1))
         for t in years
     )
     model.setObjective(objective, GRB.MINIMIZE)
@@ -415,17 +416,20 @@ def solve_network_intertemporal(Network: DistributionNetwork, R, B, dr, years, d
         fix_term_t = sum(C_S[s-1] * w_on_val[s, t] for s in S)
         edge_term_t = sum(C_L[(i, j)] * b_on_val[i, j, s, t] for (i, j) in Network.E for s in S)
         reinf_term_t = sum(C_R[s-1] * z_val[s, t] for s in S)
-        cost_per_year[t] = (fix_term_t + edge_term_t + reinf_term_t) / ((1 + dr) ** (t - 1))
-        cost_per_year_nominal[t] = fix_term_t + edge_term_t + reinf_term_t
+        opex_t = op_cost * np.sum(d_t[t])
+        cost_per_year[t] = (fix_term_t + edge_term_t + reinf_term_t + opex_t) / ((1 + dr) ** (t - 1))
+        cost_per_year_nominal[t] = fix_term_t + edge_term_t + reinf_term_t + opex_t
         cost_components_nominal[t] = {
             "substation": fix_term_t,
             "lines": edge_term_t,
-            "reinforcement": reinf_term_t
+            "reinforcement": reinf_term_t,
+            "opex": opex_t
         }
         cost_components_discounted[t] = {
             "substation": fix_term_t / ((1 + dr) ** (t - 1)),
             "lines": edge_term_t / ((1 + dr) ** (t - 1)),
             "reinforcement": reinf_term_t / ((1 + dr) ** (t - 1)),
+            "opex": opex_t / ((1 + dr) ** (t - 1)),
         }
 
     return {
@@ -450,7 +454,7 @@ def solve_network_intertemporal(Network: DistributionNetwork, R, B, dr, years, d
 # ------------------------------------------------------------
 # Stochastic (scenario-based) intertemporal model
 # ------------------------------------------------------------
-def solve_network_stochastic(Network: DistributionNetwork, R, B, dr, years, scenarios, OutputFlag=0):
+def solve_network_stochastic(Network: DistributionNetwork, R, B, dr, years, scenarios, op_cost=0.0, OutputFlag=0):
     """Solve a multi-year stochastic expansion model with shared investments and scenario-specific operations.
 
     Args:
@@ -621,7 +625,8 @@ def solve_network_stochastic(Network: DistributionNetwork, R, B, dr, years, scen
     objective = quicksum(
         (quicksum(C_S[s-1] * w_on[s, t] for s in S) +
          quicksum(C_L[(i, j)] * b_on[i, j, s, t] for (i, j) in E for s in S) +
-         quicksum(C_R[s-1] * z[s, t] for s in S)) / ((1 + dr) ** (t - 1))
+         quicksum(C_R[s-1] * z[s, t] for s in S) +
+         op_cost * quicksum(scenarios[o]['prob'] * np.sum(d_to[o][t]) for o in O)) / ((1 + dr) ** (t - 1))
         for t in years
     )
     model.setObjective(objective, GRB.MINIMIZE)
@@ -655,17 +660,20 @@ def solve_network_stochastic(Network: DistributionNetwork, R, B, dr, years, scen
         fix_term_t = sum(C_S[s-1] * w_on_val[s, t] for s in S)
         edge_term_t = sum(C_L[(i, j)] * b_on_val[i, j, s, t] for (i, j) in E for s in S)
         reinf_term_t = sum(C_R[s-1] * z_val[s, t] for s in S)
-        cost_per_year[t] = (fix_term_t + edge_term_t + reinf_term_t) / ((1 + dr) ** (t - 1))
-        cost_per_year_nominal[t] = fix_term_t + edge_term_t + reinf_term_t
+        opex_t = op_cost * sum(scenarios[o]['prob'] * np.sum(d_to[o][t]) for o in O)
+        cost_per_year[t] = (fix_term_t + edge_term_t + reinf_term_t + opex_t) / ((1 + dr) ** (t - 1))
+        cost_per_year_nominal[t] = fix_term_t + edge_term_t + reinf_term_t + opex_t
         cost_components_nominal[t] = {
             "substation": fix_term_t,
             "lines": edge_term_t,
-            "reinforcement": reinf_term_t
+            "reinforcement": reinf_term_t,
+            "opex": opex_t
         }
         cost_components_discounted[t] = {
             "substation": fix_term_t / ((1 + dr) ** (t - 1)),
             "lines": edge_term_t / ((1 + dr) ** (t - 1)),
             "reinforcement": reinf_term_t / ((1 + dr) ** (t - 1)),
+            "opex": opex_t / ((1 + dr) ** (t - 1)),
         }
 
     return {
