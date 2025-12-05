@@ -376,7 +376,8 @@ def solve_network_intertemporal(Network: DistributionNetwork, R, B, dr, years, d
         fix_term_t = quicksum(C_S[s-1] * w_on[s, t] for s in S)
         edge_term_t = quicksum(C_L[(i, j)] * b_on[i, j, s, t] for (i, j) in Network.E for s in S)
         reinf_term_t = quicksum(C_R[s-1] * z[s, t] for s in S)
-        model.addConstr(fix_term_t + edge_term_t + reinf_term_t <= budget_t, name=f"budget_{t}")
+        opex_term_t = op_cost * quicksum(w[s, t] for s in S)
+        model.addConstr(fix_term_t + edge_term_t + reinf_term_t + opex_term_t <= budget_t, name=f"budget_{t}")
 
     # Objective: discounted cost over years
     objective = quicksum(
@@ -622,13 +623,15 @@ def solve_network_stochastic(Network: DistributionNetwork, R, B, dr, years, scen
                                 quicksum(y[n, s, t, o] for n in N) - w[s, t],
                                 name=f"tree_size_{s}_{t}_{o}")
 
-        # Budget per year (investment only, scenario-invariant)
+    # Budget per year (includes opex and expected shed)
     for t in years:
         budget_t = B[t] if isinstance(B, dict) else B
         fix_term_t = quicksum(C_S[s-1] * w_on[s, t] for s in S)
         edge_term_t = quicksum(C_L[(i, j)] * b_on[i, j, s, t] for (i, j) in E for s in S)
         reinf_term_t = quicksum(C_R[s-1] * z[s, t] for s in S)
-        model.addConstr(fix_term_t + edge_term_t + reinf_term_t <= budget_t, name=f"budget_{t}")
+        opex_term_t = op_cost * quicksum(w[s, t] for s in S)
+        shed_term_t = shed_cost * quicksum(scenarios[o]['prob'] * quicksum(ls[n, t, o] for n in N) for o in O)
+        model.addConstr(fix_term_t + edge_term_t + reinf_term_t + opex_term_t + shed_term_t <= budget_t, name=f"budget_{t}")
 
     # Objective: expected (investments are scenario-invariant so prob factor optional)
     objective = quicksum(
