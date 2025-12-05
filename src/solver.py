@@ -454,7 +454,7 @@ def solve_network_intertemporal(Network: DistributionNetwork, R, B, dr, years, d
 # ------------------------------------------------------------
 # Stochastic (scenario-based) intertemporal model
 # ------------------------------------------------------------
-def solve_network_stochastic(Network: DistributionNetwork, R, B, dr, years, scenarios, op_cost=0.0, OutputFlag=0):
+def solve_network_stochastic(Network: DistributionNetwork, R, B, dr, years, scenarios, op_cost=0.0, reliability_target=1.0, shed_cost=0.0, OutputFlag=0):
     """Solve a multi-year stochastic expansion model with shared investments and scenario-specific operations.
 
     Args:
@@ -519,6 +519,8 @@ def solve_network_stochastic(Network: DistributionNetwork, R, B, dr, years, scen
                       lb=0.0, vtype=GRB.CONTINUOUS, name="f")
     r = model.addVars([(s, t, o) for s in S for t in years for o in O],
                       lb=0.0, vtype=GRB.CONTINUOUS, name="r")
+    ls = model.addVars([(n, t, o) for n in N for t in years for o in O],
+                      lb=0.0, vtype=GRB.CONTINUOUS, name="ls")  # load shedding (reliability)
 
     # Activation monotonicity
     for s in S:
@@ -552,7 +554,12 @@ def solve_network_stochastic(Network: DistributionNetwork, R, B, dr, years, scen
             d = d_to[o][t]
             M = float(np.sum(d))
 
-            model.addConstr(quicksum(r[s, t, o] for s in S) == np.sum(d), name=f"power_balance_{t}_{o}")
+            model.addConstr(quicksum(r[s, t, o] for s in S) + quicksum(ls[n, t, o] for n in N) == np.sum(d),
+                            name=f"power_balance_{t}_{o}")
+
+            # Reliability: limit shed to (1 - reliability_target) fraction of demand
+            model.addConstr(quicksum(ls[n, t, o] for n in N) <= (1 - reliability_target) * np.sum(d),
+                            name=f"reliability_{t}_{o}")
 
             for n in N:
                 for s in S:
@@ -626,7 +633,9 @@ def solve_network_stochastic(Network: DistributionNetwork, R, B, dr, years, scen
         (quicksum(C_S[s-1] * w_on[s, t] for s in S) +
          quicksum(C_L[(i, j)] * b_on[i, j, s, t] for (i, j) in E for s in S) +
          quicksum(C_R[s-1] * z[s, t] for s in S) +
-         op_cost * quicksum(w[s, t] for s in S)) / ((1 + dr) ** (t - 1))
+         op_cost * quicksum(w[s, t] for s in S) +
+         shed_cost * quicksum(scenarios[o]['prob'] * quicksum(ls[n, t, o] for n in N) for o in O)
+         ) / ((1 + dr) ** (t - 1))
         for t in years
     )
     model.setObjective(objective, GRB.MINIMIZE)
@@ -648,6 +657,7 @@ def solve_network_stochastic(Network: DistributionNetwork, R, B, dr, years, scen
     x_val = {(i, j, s, t, o): x[i, j, s, t, o].X for (i, j) in A for s in S for t in years for o in O}
     f_val = {(s, i, j, t, o): f[s, i, j, t, o].X for s in S for (i, j) in A for t in years for o in O}
     r_val = {(s, t, o): r[s, t, o].X for s in S for t in years for o in O}
+    ls_val = {(n, t, o): ls[n, t, o].X for n in N for t in years for o in O}
 
     P_val = {(s, t): (P[s-1] + R * sum(z_val[s, tau] for tau in years if tau <= t)) * w_val[s, t]
              for s in S for t in years}
@@ -661,19 +671,22 @@ def solve_network_stochastic(Network: DistributionNetwork, R, B, dr, years, scen
         edge_term_t = sum(C_L[(i, j)] * b_on_val[i, j, s, t] for (i, j) in E for s in S)
         reinf_term_t = sum(C_R[s-1] * z_val[s, t] for s in S)
         opex_t = op_cost * sum(w_val[s, t] for s in S)
-        cost_per_year[t] = (fix_term_t + edge_term_t + reinf_term_t + opex_t) / ((1 + dr) ** (t - 1))
-        cost_per_year_nominal[t] = fix_term_t + edge_term_t + reinf_term_t + opex_t
+        shed_t = shed_cost * sum(scenarios[o]['prob'] * sum(ls_val[n, t, o] for n in N) for o in O)
+        cost_per_year[t] = (fix_term_t + edge_term_t + reinf_term_t + opex_t + shed_t) / ((1 + dr) ** (t - 1))
+        cost_per_year_nominal[t] = fix_term_t + edge_term_t + reinf_term_t + opex_t + shed_t
         cost_components_nominal[t] = {
             "substation": fix_term_t,
             "lines": edge_term_t,
             "reinforcement": reinf_term_t,
-            "opex": opex_t
+            "opex": opex_t,
+            "shed": shed_t
         }
         cost_components_discounted[t] = {
             "substation": fix_term_t / ((1 + dr) ** (t - 1)),
             "lines": edge_term_t / ((1 + dr) ** (t - 1)),
             "reinforcement": reinf_term_t / ((1 + dr) ** (t - 1)),
             "opex": opex_t / ((1 + dr) ** (t - 1)),
+            "shed": shed_t / ((1 + dr) ** (t - 1)),
         }
 
     return {
@@ -691,5 +704,6 @@ def solve_network_stochastic(Network: DistributionNetwork, R, B, dr, years, scen
         "y": y_val,
         "x": x_val,
         "f": f_val,
-        "r": r_val
+        "r": r_val,
+        "ls": ls_val
     }
