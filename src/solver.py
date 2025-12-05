@@ -560,6 +560,8 @@ def solve_network_stochastic(Network: DistributionNetwork, R, B, dr, years, scen
             # Reliability: limit shed to (1 - reliability_target) fraction of demand
             model.addConstr(quicksum(ls[n, t, o] for n in N) <= (1 - reliability_target) * np.sum(d),
                             name=f"reliability_{t}_{o}")
+            for n in N:
+                model.addConstr(ls[n, t, o] <= d[n-1], name=f"ls_cap_{n}_{t}_{o}")
 
             for n in N:
                 for s in S:
@@ -576,7 +578,7 @@ def solve_network_stochastic(Network: DistributionNetwork, R, B, dr, years, scen
                         model.addConstr(y[node_idx, s2, t, o] == 0, name=f"substation_no_assign_{s}_{s2}_{t}_{o}")
 
             for s in S:
-                model.addConstr(r[s, t, o] == quicksum(d[n-1] * y[n, s, t, o] for n in N),
+                model.addConstr(r[s, t, o] == quicksum((d[n-1] - ls[n, t, o]) * y[n, s, t, o] for n in N),
                                 name=f"supply_def_{s}_{t}_{o}")
 
             for s in S:
@@ -594,7 +596,7 @@ def solve_network_stochastic(Network: DistributionNetwork, R, B, dr, years, scen
                     if n == N_S[s-1]:
                         model.addConstr(outgoing - incoming == r[s, t, o], name=f"flow_balance_sub_{s}_{n}_{t}_{o}")
                     elif n in N_NS:
-                        model.addConstr(outgoing - incoming == -d[n-1] * y[n, s, t, o],
+                        model.addConstr(outgoing - incoming == -(d[n-1] - ls[n, t, o]) * y[n, s, t, o],
                                         name=f"flow_balance_{s}_{n}_{t}_{o}")
 
             for s in S:
