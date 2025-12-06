@@ -603,22 +603,26 @@ def solve_network_stochastic(Network: DistributionNetwork, R, B, dr, years, scen
                 model.addConstr(quicksum(x[i, j, s, t, o] for (i, j) in A) == quicksum(y[n, s, t, o] for n in N) - w[s, t],
                                 name=f"tree_size_{s}_{t}_{o}")
 
-    # Budget per year (expected nominal)
+    # Budget per year, per scenario (nominal in that scenario)
     for t in years:
         budget_t = B[t] if isinstance(B, dict) else B
-        fix_term_t = quicksum(C_S[s-1] * w_on[s, t] for s in S)
-        edge_term_t = quicksum(C_L[(i, j)] * b_on[i, j, s, t] for (i, j) in E for s in S)
-        connect_term_t = connect_cost * quicksum(scenarios[o]['prob'] * quicksum(x_on[i, j, s, t, o] for (i, j) in A for s in S) for o in O)
-        disconnect_term_t = disconnect_cost * quicksum(scenarios[o]['prob'] * quicksum(x_off[i, j, s, t, o] for (i, j) in A for s in S) for o in O)
-        reinf_term_t = quicksum(C_R[s-1] * z[s, t] for s in S)
-        opex_term_t = op_cost * quicksum(w[s, t] for s in S)
-        shed_term_t = shed_cost * quicksum(scenarios[o]['prob'] * quicksum(ls[n, t, o] for n in N) for o in O)
-        model.addConstr(fix_term_t + edge_term_t + connect_term_t + disconnect_term_t + reinf_term_t + opex_term_t + shed_term_t <= budget_t, name=f"budget_{t}")
+        for o in O:
+            fix_term_t = quicksum(C_S[s-1] * w_on[s, t] for s in S)
+            edge_term_t = quicksum(C_L[(i, j)] * b_on[i, j, s, t] for (i, j) in E for s in S)
+            connect_term_t = connect_cost * quicksum(x_on[i, j, s, t, o] for (i, j) in A for s in S)
+            disconnect_term_t = disconnect_cost * quicksum(x_off[i, j, s, t, o] for (i, j) in A for s in S)
+            reinf_term_t = quicksum(C_R[s-1] * z[s, t] for s in S)
+            opex_term_t = op_cost * quicksum(w[s, t] for s in S)
+            shed_term_t = shed_cost * quicksum(ls[n, t, o] for n in N)
+            model.addConstr(
+                fix_term_t + edge_term_t + connect_term_t + disconnect_term_t + reinf_term_t + opex_term_t + shed_term_t
+                <= budget_t, name=f"budget_{t}_{o}")
 
     # Objective: expected discounted cost
     objective = quicksum(
         (quicksum(C_S[s-1] * w_on[s, t] for s in S) +
          quicksum(C_L[(i, j)] * b_on[i, j, s, t] for (i, j) in E for s in S) +
+         # Connection/disconnection costs weighted by scenario probability in objective (expected cost)
          connect_cost * quicksum(scenarios[o]['prob'] * quicksum(x_on[i, j, s, t, o] for (i, j) in A for s in S) for o in O) +
          disconnect_cost * quicksum(scenarios[o]['prob'] * quicksum(x_off[i, j, s, t, o] for (i, j) in A for s in S) for o in O) +
          quicksum(C_R[s-1] * z[s, t] for s in S) +
@@ -651,39 +655,66 @@ def solve_network_stochastic(Network: DistributionNetwork, R, B, dr, years, scen
 
     P_val = {(s, t): (P[s-1] + R * sum(z_val[s, tau] for tau in years if tau <= t)) * w_val[s, t] for s in S for t in years}
 
-    cost_per_year = {}
-    cost_per_year_nominal = {}
-    cost_components_nominal = {}
-    cost_components_discounted = {}
+    # Scenario-specific costs (nominal and discounted) plus expected aggregates
+    cost_per_year = {o: {} for o in O}
+    cost_per_year_nominal = {o: {} for o in O}
+    cost_components_nominal = {o: {} for o in O}
+    cost_components_discounted = {o: {} for o in O}
+
+    expected_cost_per_year = {}
+    expected_cost_per_year_nominal = {}
+    expected_cost_components_nominal = {}
+    expected_cost_components_discounted = {}
+
     for t in years:
-        fix_term_t = sum(C_S[s-1] * w_on_val[s, t] for s in S)
-        edge_term_t = sum(C_L[(i, j)] * b_on_val[i, j, s, t] for (i, j) in E for s in S)
-        connect_term_t = connect_cost * sum(scenarios[o]['prob'] * sum(x_on_val[i, j, s, t, o] for (i, j) in A for s in S) for o in O)
-        disconnect_term_t = disconnect_cost * sum(scenarios[o]['prob'] * sum(x_off_val[i, j, s, t, o] for (i, j) in A for s in S) for o in O)
-        reinf_term_t = sum(C_R[s-1] * z_val[s, t] for s in S)
-        opex_t = op_cost * sum(w_val[s, t] for s in S)
-        shed_t = shed_cost * sum(scenarios[o]['prob'] * sum(ls_val[n, t, o] for n in N) for o in O)
-        cost_per_year_nominal[t] = fix_term_t + edge_term_t + connect_term_t + disconnect_term_t + reinf_term_t + opex_t + shed_t
-        cost_per_year[t] = cost_per_year_nominal[t] / ((1 + dr) ** (t - 1))
-        cost_components_nominal[t] = {
-            "substation": fix_term_t,
-            "lines": edge_term_t,
-            "connect": connect_term_t,
-            "disconnect": disconnect_term_t,
-            "reinforcement": reinf_term_t,
-            "opex": opex_t,
-            "shed": shed_t,
+        for o in O:
+            fix_term_t = sum(C_S[s-1] * w_on_val[s, t] for s in S)
+            edge_term_t = sum(C_L[(i, j)] * b_on_val[i, j, s, t] for (i, j) in E for s in S)
+            connect_term_t = connect_cost * sum(x_on_val[i, j, s, t, o] for (i, j) in A for s in S)
+            disconnect_term_t = disconnect_cost * sum(x_off_val[i, j, s, t, o] for (i, j) in A for s in S)
+            reinf_term_t = sum(C_R[s-1] * z_val[s, t] for s in S)
+            opex_t = op_cost * sum(w_val[s, t] for s in S)
+            shed_t = shed_cost * sum(ls_val[n, t, o] for n in N)
+
+            nominal = fix_term_t + edge_term_t + connect_term_t + disconnect_term_t + reinf_term_t + opex_t + shed_t
+            cost_per_year_nominal[o][t] = nominal
+            cost_per_year[o][t] = nominal / ((1 + dr) ** (t - 1))
+            cost_components_nominal[o][t] = {
+                "substation": fix_term_t,
+                "lines": edge_term_t,
+                "connect": connect_term_t,
+                "disconnect": disconnect_term_t,
+                "reinforcement": reinf_term_t,
+                "opex": opex_t,
+                "shed": shed_t,
+            }
+            cost_components_discounted[o][t] = {
+                k: v / ((1 + dr) ** (t - 1)) for k, v in cost_components_nominal[o][t].items()
+            }
+
+        # Expected aggregates (probability-weighted) for convenience
+        expected_cost_per_year_nominal[t] = sum(scenarios[o]['prob'] * cost_per_year_nominal[o][t] for o in O)
+        expected_cost_per_year[t] = expected_cost_per_year_nominal[t] / ((1 + dr) ** (t - 1))
+        expected_cost_components_nominal[t] = {
+            k: sum(scenarios[o]['prob'] * cost_components_nominal[o][t][k] for o in O)
+            for k in ["substation", "lines", "connect", "disconnect", "reinforcement", "opex", "shed"]
         }
-        cost_components_discounted[t] = {
-            k: v / ((1 + dr) ** (t - 1)) for k, v in cost_components_nominal[t].items()
+        expected_cost_components_discounted[t] = {
+            k: v / ((1 + dr) ** (t - 1)) for k, v in expected_cost_components_nominal[t].items()
         }
 
     return {
         "objective": model.ObjVal,
+        # Scenario-specific costs
         "cost_per_year": cost_per_year,
         "cost_per_year_nominal": cost_per_year_nominal,
         "cost_components_nominal": cost_components_nominal,
         "cost_components_discounted": cost_components_discounted,
+        # Expected (probability-weighted) costs
+        "expected_cost_per_year": expected_cost_per_year,
+        "expected_cost_per_year_nominal": expected_cost_per_year_nominal,
+        "expected_cost_components_nominal": expected_cost_components_nominal,
+        "expected_cost_components_discounted": expected_cost_components_discounted,
         "w": w_val,
         "w_on": w_on_val,
         "b": b_val,
