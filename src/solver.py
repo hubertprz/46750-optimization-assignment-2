@@ -214,11 +214,12 @@ def print_results(Network, solution, detailed=False):
 # ------------------------------------------------------------
 # Intertemporal (multi-year) extension of the network problem
 # ------------------------------------------------------------
-def solve_network_intertemporal(Network: DistributionNetwork, R, B, dr, years, demands, op_cost=0.0, OutputFlag=0):
+def solve_network_intertemporal(Network: DistributionNetwork, R, B, dr, years, demands, op_cost=0.0,
+                                 connect_cost=25.0, disconnect_cost=25.0, OutputFlag=0):
     """Multi-year deterministic expansion model (Model 2).
 
     Investments are shared across years (once-built stays built). Budgets include
-    substation activations, line builds, reinforcements, and opex.
+    substation activations, line builds, reinforcements, opex, and connection changes.
     """
     # Sets
     N = list(np.arange(1, len(Network.NODES)+1))
@@ -254,6 +255,8 @@ def solve_network_intertemporal(Network: DistributionNetwork, R, B, dr, years, d
     b_on = model.addVars([(i, j, s, t) for (i, j) in E for s in S for t in years], vtype=GRB.BINARY, name="b_on")
     y = model.addVars([(i, s, t) for i in N for s in S for t in years], vtype=GRB.BINARY, name="y")
     x = model.addVars([(i, j, s, t) for (i, j) in A for s in S for t in years], vtype=GRB.BINARY, name="x")
+    x_on = model.addVars([(i, j, s, t) for (i, j) in A for s in S for t in years], vtype=GRB.BINARY, name="x_on")
+    x_off = model.addVars([(i, j, s, t) for (i, j) in A for s in S for t in years], vtype=GRB.BINARY, name="x_off")
     z = model.addVars(S, years, lb=0, vtype=GRB.INTEGER, name="z")
     f = model.addVars([(s, i, j, t) for s in S for (i, j) in A for t in years], lb=0.0, vtype=GRB.CONTINUOUS, name="f")
     r = model.addVars(S, years, lb=0.0, vtype=GRB.CONTINUOUS, name="r")
@@ -329,6 +332,16 @@ def solve_network_intertemporal(Network: DistributionNetwork, R, B, dr, years, d
                 model.addConstr(f[s, i, j, t] <= M * x[i, j, s, t], name=f"f_cap_{s}_{i}_{j}_{t}")
                 e = (min(i, j), max(i, j))
                 model.addConstr(x[i, j, s, t] <= b[e[0], e[1], s, t], name=f"x_le_b_{s}_{i}_{j}_{t}")
+                # Connection change tracking
+                if t == years[0]:
+                    model.addConstr(x_on[i, j, s, t] == x[i, j, s, t], name=f"x_on_init_{s}_{i}_{j}_{t}")
+                    model.addConstr(x_off[i, j, s, t] == 0, name=f"x_off_init_{s}_{i}_{j}_{t}")
+                else:
+                    t_prev = years[years.index(t)-1]
+                    model.addConstr(x_on[i, j, s, t] >= x[i, j, s, t] - x[i, j, s, t_prev], name=f"x_on_diff_{s}_{i}_{j}_{t}")
+                    model.addConstr(x_on[i, j, s, t] <= x[i, j, s, t], name=f"x_on_le_x_{s}_{i}_{j}_{t}")
+                    model.addConstr(x_off[i, j, s, t] >= x[i, j, s, t_prev] - x[i, j, s, t], name=f"x_off_diff_{s}_{i}_{j}_{t}")
+                    model.addConstr(x_off[i, j, s, t] <= x[i, j, s, t_prev], name=f"x_off_le_prev_{s}_{i}_{j}_{t}")
 
         for s in S:
             for n in N_NS:
@@ -347,14 +360,18 @@ def solve_network_intertemporal(Network: DistributionNetwork, R, B, dr, years, d
         budget_t = B[t] if isinstance(B, dict) else B
         fix_term_t = quicksum(C_S[s-1] * w_on[s, t] for s in S)
         edge_term_t = quicksum(C_L[(i, j)] * b_on[i, j, s, t] for (i, j) in E for s in S)
+        connect_term_t = connect_cost * quicksum(x_on[i, j, s, t] for (i, j) in A for s in S)
+        disconnect_term_t = disconnect_cost * quicksum(x_off[i, j, s, t] for (i, j) in A for s in S)
         reinf_term_t = quicksum(C_R[s-1] * z[s, t] for s in S)
         opex_term_t = op_cost * quicksum(w[s, t] for s in S)
-        model.addConstr(fix_term_t + edge_term_t + reinf_term_t + opex_term_t <= budget_t, name=f"budget_{t}")
+        model.addConstr(fix_term_t + edge_term_t + connect_term_t + disconnect_term_t + reinf_term_t + opex_term_t <= budget_t, name=f"budget_{t}")
 
     # Objective: discounted cost
     objective = quicksum(
         (quicksum(C_S[s-1] * w_on[s, t] for s in S) +
          quicksum(C_L[(i, j)] * b_on[i, j, s, t] for (i, j) in E for s in S) +
+         connect_cost * quicksum(x_on[i, j, s, t] for (i, j) in A for s in S) +
+         disconnect_cost * quicksum(x_off[i, j, s, t] for (i, j) in A for s in S) +
          quicksum(C_R[s-1] * z[s, t] for s in S) +
          op_cost * quicksum(w[s, t] for s in S)) / ((1 + dr) ** (t - 1))
         for t in years
@@ -379,6 +396,8 @@ def solve_network_intertemporal(Network: DistributionNetwork, R, B, dr, years, d
              for s in S for t in years}
     b_val = {(i, j, s, t): b[i, j, s, t].X for (i, j) in E for s in S for t in years}
     b_on_val = {(i, j, s, t): b_on[i, j, s, t].X for (i, j) in E for s in S for t in years}
+    x_on_val = {(i, j, s, t): x_on[i, j, s, t].X for (i, j) in A for s in S for t in years}
+    x_off_val = {(i, j, s, t): x_off[i, j, s, t].X for (i, j) in A for s in S for t in years}
 
     cost_per_year = {}
     cost_per_year_nominal = {}
@@ -387,13 +406,17 @@ def solve_network_intertemporal(Network: DistributionNetwork, R, B, dr, years, d
     for t in years:
         fix_term_t = sum(C_S[s-1] * w_on_val[s, t] for s in S)
         edge_term_t = sum(C_L[(i, j)] * b_on_val[i, j, s, t] for (i, j) in E for s in S)
+        connect_term_t = connect_cost * sum(x_on_val[i, j, s, t] for (i, j) in A for s in S)
+        disconnect_term_t = disconnect_cost * sum(x_off_val[i, j, s, t] for (i, j) in A for s in S)
         reinf_term_t = sum(C_R[s-1] * z_val[s, t] for s in S)
         opex_t = op_cost * sum(w_val[s, t] for s in S)
-        cost_per_year_nominal[t] = fix_term_t + edge_term_t + reinf_term_t + opex_t
+        cost_per_year_nominal[t] = fix_term_t + edge_term_t + connect_term_t + disconnect_term_t + reinf_term_t + opex_t
         cost_per_year[t] = cost_per_year_nominal[t] / ((1 + dr) ** (t - 1))
         cost_components_nominal[t] = {
             "substation": fix_term_t,
             "lines": edge_term_t,
+            "connect": connect_term_t,
+            "disconnect": disconnect_term_t,
             "reinforcement": reinf_term_t,
             "opex": opex_t,
         }
@@ -411,6 +434,8 @@ def solve_network_intertemporal(Network: DistributionNetwork, R, B, dr, years, d
         "w_on": w_on_val,
         "b": b_val,
         "b_on": b_on_val,
+        "x_on": x_on_val,
+        "x_off": x_off_val,
         "y": y_val,
         "x": x_val,
         "f": f_val,
@@ -423,7 +448,9 @@ def solve_network_intertemporal(Network: DistributionNetwork, R, B, dr, years, d
 # ------------------------------------------------------------
 # Stochastic (scenario-based) intertemporal model
 # ------------------------------------------------------------
-def solve_network_stochastic(Network: DistributionNetwork, R, B, dr, years, scenarios, op_cost=0.0, reliability_target=1.0, shed_cost=0.0, OutputFlag=0):
+def solve_network_stochastic(Network: DistributionNetwork, R, B, dr, years, scenarios, op_cost=0.0,
+                             connect_cost=25.0, disconnect_cost=25.0, reliability_target=1.0,
+                             shed_cost=0.0, OutputFlag=0):
     """Stochastic multi-year model (Model 3) with shared investments and scenario ops.
 
     Budgets include capex, opex, and expected shed cost. Reliability is enforced via
@@ -470,6 +497,8 @@ def solve_network_stochastic(Network: DistributionNetwork, R, B, dr, years, scen
     # Operational (scenario-specific)
     y = model.addVars([(i, s, t, o) for i in N for s in S for t in years for o in O], vtype=GRB.BINARY, name="y")
     x = model.addVars([(i, j, s, t, o) for (i, j) in A for s in S for t in years for o in O], vtype=GRB.BINARY, name="x")
+    x_on = model.addVars([(i, j, s, t, o) for (i, j) in A for s in S for t in years for o in O], vtype=GRB.BINARY, name="x_on")
+    x_off = model.addVars([(i, j, s, t, o) for (i, j) in A for s in S for t in years for o in O], vtype=GRB.BINARY, name="x_off")
     f = model.addVars([(s, i, j, t, o) for s in S for (i, j) in A for t in years for o in O], lb=0.0, vtype=GRB.CONTINUOUS, name="f")
     r = model.addVars([(s, t, o) for s in S for t in years for o in O], lb=0.0, vtype=GRB.CONTINUOUS, name="r")
     ls = model.addVars([(n, t, o) for n in N for t in years for o in O], lb=0.0, vtype=GRB.CONTINUOUS, name="ls")
@@ -549,6 +578,15 @@ def solve_network_stochastic(Network: DistributionNetwork, R, B, dr, years, scen
                     model.addConstr(f[s, i, j, t, o] <= M * x[i, j, s, t, o], name=f"f_cap_{s}_{i}_{j}_{t}_{o}")
                     e = (min(i, j), max(i, j))
                     model.addConstr(x[i, j, s, t, o] <= b[e[0], e[1], s, t], name=f"x_le_b_{s}_{i}_{j}_{t}_{o}")
+                    if t == years[0]:
+                        model.addConstr(x_on[i, j, s, t, o] == x[i, j, s, t, o], name=f"x_on_init_{s}_{i}_{j}_{t}_{o}")
+                        model.addConstr(x_off[i, j, s, t, o] == 0, name=f"x_off_init_{s}_{i}_{j}_{t}_{o}")
+                    else:
+                        t_prev = years[years.index(t)-1]
+                        model.addConstr(x_on[i, j, s, t, o] >= x[i, j, s, t, o] - x[i, j, s, t_prev, o], name=f"x_on_diff_{s}_{i}_{j}_{t}_{o}")
+                        model.addConstr(x_on[i, j, s, t, o] <= x[i, j, s, t, o], name=f"x_on_le_x_{s}_{i}_{j}_{t}_{o}")
+                        model.addConstr(x_off[i, j, s, t, o] >= x[i, j, s, t_prev, o] - x[i, j, s, t, o], name=f"x_off_diff_{s}_{i}_{j}_{t}_{o}")
+                        model.addConstr(x_off[i, j, s, t, o] <= x[i, j, s, t_prev, o], name=f"x_off_le_prev_{s}_{i}_{j}_{t}_{o}")
 
             for s in S:
                 for n in N_NS:
@@ -568,15 +606,19 @@ def solve_network_stochastic(Network: DistributionNetwork, R, B, dr, years, scen
         budget_t = B[t] if isinstance(B, dict) else B
         fix_term_t = quicksum(C_S[s-1] * w_on[s, t] for s in S)
         edge_term_t = quicksum(C_L[(i, j)] * b_on[i, j, s, t] for (i, j) in E for s in S)
+        connect_term_t = connect_cost * quicksum(scenarios[o]['prob'] * quicksum(x_on[i, j, s, t, o] for (i, j) in A for s in S) for o in O)
+        disconnect_term_t = disconnect_cost * quicksum(scenarios[o]['prob'] * quicksum(x_off[i, j, s, t, o] for (i, j) in A for s in S) for o in O)
         reinf_term_t = quicksum(C_R[s-1] * z[s, t] for s in S)
         opex_term_t = op_cost * quicksum(w[s, t] for s in S)
         shed_term_t = shed_cost * quicksum(scenarios[o]['prob'] * quicksum(ls[n, t, o] for n in N) for o in O)
-        model.addConstr(fix_term_t + edge_term_t + reinf_term_t + opex_term_t + shed_term_t <= budget_t, name=f"budget_{t}")
+        model.addConstr(fix_term_t + edge_term_t + connect_term_t + disconnect_term_t + reinf_term_t + opex_term_t + shed_term_t <= budget_t, name=f"budget_{t}")
 
     # Objective: expected discounted cost
     objective = quicksum(
         (quicksum(C_S[s-1] * w_on[s, t] for s in S) +
          quicksum(C_L[(i, j)] * b_on[i, j, s, t] for (i, j) in E for s in S) +
+         connect_cost * quicksum(scenarios[o]['prob'] * quicksum(x_on[i, j, s, t, o] for (i, j) in A for s in S) for o in O) +
+         disconnect_cost * quicksum(scenarios[o]['prob'] * quicksum(x_off[i, j, s, t, o] for (i, j) in A for s in S) for o in O) +
          quicksum(C_R[s-1] * z[s, t] for s in S) +
          op_cost * quicksum(w[s, t] for s in S) +
          shed_cost * quicksum(scenarios[o]['prob'] * quicksum(ls[n, t, o] for n in N) for o in O)) / ((1 + dr) ** (t - 1))
@@ -600,6 +642,8 @@ def solve_network_stochastic(Network: DistributionNetwork, R, B, dr, years, scen
     y_val = {(i, s, t, o): y[i, s, t, o].X for i in N for s in S for t in years for o in O}
     x_val = {(i, j, s, t, o): x[i, j, s, t, o].X for (i, j) in A for s in S for t in years for o in O}
     f_val = {(s, i, j, t, o): f[s, i, j, t, o].X for s in S for (i, j) in A for t in years for o in O}
+    x_on_val = {(i, j, s, t, o): x_on[i, j, s, t, o].X for (i, j) in A for s in S for t in years for o in O}
+    x_off_val = {(i, j, s, t, o): x_off[i, j, s, t, o].X for (i, j) in A for s in S for t in years for o in O}
     r_val = {(s, t, o): r[s, t, o].X for s in S for t in years for o in O}
     ls_val = {(n, t, o): ls[n, t, o].X for n in N for t in years for o in O}
 
@@ -612,14 +656,18 @@ def solve_network_stochastic(Network: DistributionNetwork, R, B, dr, years, scen
     for t in years:
         fix_term_t = sum(C_S[s-1] * w_on_val[s, t] for s in S)
         edge_term_t = sum(C_L[(i, j)] * b_on_val[i, j, s, t] for (i, j) in E for s in S)
+        connect_term_t = connect_cost * sum(scenarios[o]['prob'] * sum(x_on_val[i, j, s, t, o] for (i, j) in A for s in S) for o in O)
+        disconnect_term_t = disconnect_cost * sum(scenarios[o]['prob'] * sum(x_off_val[i, j, s, t, o] for (i, j) in A for s in S) for o in O)
         reinf_term_t = sum(C_R[s-1] * z_val[s, t] for s in S)
         opex_t = op_cost * sum(w_val[s, t] for s in S)
         shed_t = shed_cost * sum(scenarios[o]['prob'] * sum(ls_val[n, t, o] for n in N) for o in O)
-        cost_per_year_nominal[t] = fix_term_t + edge_term_t + reinf_term_t + opex_t + shed_t
+        cost_per_year_nominal[t] = fix_term_t + edge_term_t + connect_term_t + disconnect_term_t + reinf_term_t + opex_t + shed_t
         cost_per_year[t] = cost_per_year_nominal[t] / ((1 + dr) ** (t - 1))
         cost_components_nominal[t] = {
             "substation": fix_term_t,
             "lines": edge_term_t,
+            "connect": connect_term_t,
+            "disconnect": disconnect_term_t,
             "reinforcement": reinf_term_t,
             "opex": opex_t,
             "shed": shed_t,
