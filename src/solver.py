@@ -334,7 +334,8 @@ def solve_network_intertemporal(Network: DistributionNetwork, R, B, dr, years, d
                 model.addConstr(x[i, j, s, t] <= b[e[0], e[1], s, t], name=f"x_le_b_{s}_{i}_{j}_{t}")
                 # Connection change tracking
                 if t == years[0]:
-                    model.addConstr(x_on[i, j, s, t] == x[i, j, s, t], name=f"x_on_init_{s}_{i}_{j}_{t}")
+                    # No connection/disconnection cost in first year
+                    model.addConstr(x_on[i, j, s, t] == 0, name=f"x_on_init_{s}_{i}_{j}_{t}")
                     model.addConstr(x_off[i, j, s, t] == 0, name=f"x_off_init_{s}_{i}_{j}_{t}")
                 else:
                     t_prev = years[years.index(t)-1]
@@ -579,7 +580,8 @@ def solve_network_stochastic(Network: DistributionNetwork, R, B, dr, years, scen
                     e = (min(i, j), max(i, j))
                     model.addConstr(x[i, j, s, t, o] <= b[e[0], e[1], s, t], name=f"x_le_b_{s}_{i}_{j}_{t}_{o}")
                     if t == years[0]:
-                        model.addConstr(x_on[i, j, s, t, o] == x[i, j, s, t, o], name=f"x_on_init_{s}_{i}_{j}_{t}_{o}")
+                        # No connection/disconnection cost in first year
+                        model.addConstr(x_on[i, j, s, t, o] == 0, name=f"x_on_init_{s}_{i}_{j}_{t}_{o}")
                         model.addConstr(x_off[i, j, s, t, o] == 0, name=f"x_off_init_{s}_{i}_{j}_{t}_{o}")
                     else:
                         t_prev = years[years.index(t)-1]
