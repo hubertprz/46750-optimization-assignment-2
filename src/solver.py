@@ -215,25 +215,17 @@ def print_results(Network, solution, detailed=False):
 # Intertemporal (multi-year) extension of the network problem
 # ------------------------------------------------------------
 def solve_network_intertemporal(Network: DistributionNetwork, R, B, dr, years, demands, op_cost=0.0, OutputFlag=0):
-    """Solve a multi-year deterministic expansion model in one optimization.
+    """Multi-year deterministic expansion model (Model 2).
 
-    Args:
-        Network (DistributionNetwork): Base distribution network (static topology and costs).
-        R (float): Size of a single capacity reinforcement.
-        B (float or dict): Annual budget (scalar for constant budget or dict {t: B_t}).
-        dr (float): Discount rate.
-        years (list[int]): List of year indices, e.g., [1,2,...,T].
-        demands (dict): Mapping year -> load_capacity dict for that year.
-        OutputFlag (int): Gurobi output flag.
-
-    Returns:
-        dict: per-year decision dictionaries (w, y, x, f, r, z, P) and objective value.
+    Investments are shared across years (once-built stays built). Budgets include
+    substation activations, line builds, reinforcements, and opex.
     """
     # Sets
     N = list(np.arange(1, len(Network.NODES)+1))
     S = list(np.arange(1, len(Network.SUBSTATIONS)+1))
-    S_0 = [int(s.id[1:]) for s in Network.SUBSTATIONS if s.fix_cost == 0]  # existing online substations
+    S_0 = [int(s.id[1:]) for s in Network.SUBSTATIONS if s.fix_cost == 0]
     A = Network.A
+    E = Network.E
     N_S = [int(sub.node[1:]) for sub in Network.SUBSTATIONS]
     N_NS = np.delete(np.array(N), np.array(N_S)-1)
 
@@ -243,7 +235,7 @@ def solve_network_intertemporal(Network: DistributionNetwork, R, B, dr, years, d
     C_L = Network.edge_cost
     C_R = [s.r_cost for s in Network.SUBSTATIONS]
 
-    # Precompute demand vectors per year
+    # Demand per year mapped to nodes
     d_t = {}
     for t in years:
         L = demands[t]
@@ -255,22 +247,18 @@ def solve_network_intertemporal(Network: DistributionNetwork, R, B, dr, years, d
 
     model = gp.Model("Radial_Distribution_Network_Intertemporal")
 
-    # Decision variables (time-indexed)
-    w = model.addVars(S, years, vtype=GRB.BINARY, name="w")  # activation (can stay on across years)
-    w_on = model.addVars(S, years, vtype=GRB.BINARY, name="w_on")  # activation event (costed once)
-    # Line build status (undirected edge) and use (directed arc)
-    b = model.addVars([(min(i, j), max(i, j), s, t) for (i, j) in Network.E for s in S for t in years],
-                      vtype=GRB.BINARY, name="b")  # built status (monotone)
-    b_on = model.addVars([(min(i, j), max(i, j), s, t) for (i, j) in Network.E for s in S for t in years],
-                         vtype=GRB.BINARY, name="b_on")  # build event (costed once)
+    # Investment & operation variables
+    w = model.addVars(S, years, vtype=GRB.BINARY, name="w")
+    w_on = model.addVars(S, years, vtype=GRB.BINARY, name="w_on")
+    b = model.addVars([(i, j, s, t) for (i, j) in E for s in S for t in years], vtype=GRB.BINARY, name="b")
+    b_on = model.addVars([(i, j, s, t) for (i, j) in E for s in S for t in years], vtype=GRB.BINARY, name="b_on")
     y = model.addVars([(i, s, t) for i in N for s in S for t in years], vtype=GRB.BINARY, name="y")
     x = model.addVars([(i, j, s, t) for (i, j) in A for s in S for t in years], vtype=GRB.BINARY, name="x")
     z = model.addVars(S, years, lb=0, vtype=GRB.INTEGER, name="z")
-    f = model.addVars([(s, i, j, t) for s in S for (i, j) in A for t in years],
-                      lb=0.0, vtype=GRB.CONTINUOUS, name="f")
+    f = model.addVars([(s, i, j, t) for s in S for (i, j) in A for t in years], lb=0.0, vtype=GRB.CONTINUOUS, name="f")
     r = model.addVars(S, years, lb=0.0, vtype=GRB.CONTINUOUS, name="r")
 
-    # Monotonic activation (cannot turn off)
+    # Monotone activations
     for s in S:
         first_t = years[0]
         model.addConstr(w_on[s, first_t] == w[s, first_t], name=f"w_on_init_{s}")
@@ -284,9 +272,9 @@ def solve_network_intertemporal(Network: DistributionNetwork, R, B, dr, years, d
             if s in S_0:
                 model.addConstr(w[s, t_cur] == 1, name=f"w_fix_{s}_{t_cur}")
 
-    # Line build monotonicity and linking to use (pay once)
+    # Monotone line builds
     for s in S:
-        for (i_u, j_u) in Network.E:
+        for (i_u, j_u) in E:
             first_t = years[0]
             model.addConstr(b_on[i_u, j_u, s, first_t] == b[i_u, j_u, s, first_t], name=f"b_on_init_{s}_{i_u}_{j_u}")
             for idx in range(1, len(years)):
@@ -296,15 +284,13 @@ def solve_network_intertemporal(Network: DistributionNetwork, R, B, dr, years, d
                 model.addConstr(b_on[i_u, j_u, s, t_cur] >= b[i_u, j_u, s, t_cur] - b[i_u, j_u, s, t_prev],
                                 name=f"b_on_diff_{s}_{i_u}_{j_u}_{t_cur}")
 
-    # Constraints per year
+    # Constraints by year
     for t in years:
         d = d_t[t]
         M = float(np.sum(d))
 
-        # Power balance
         model.addConstr(quicksum(r[s, t] for s in S) == np.sum(d), name=f"power_balance_{t}")
 
-        # Node assignment and feasibility
         for n in N:
             for s in S:
                 model.addConstr(y[n, s, t] <= w[s, t], name=f"y_le_w_{n}_{s}_{t}")
@@ -319,22 +305,16 @@ def solve_network_intertemporal(Network: DistributionNetwork, R, B, dr, years, d
                 if s2 != s:
                     model.addConstr(y[node_idx, s2, t] == 0, name=f"substation_no_assign_{s}_{s2}_{t}")
 
-        # Substation supply
         for s in S:
-            model.addConstr(r[s, t] == quicksum(d[n-1] * y[n, s, t] for n in N),
-                            name=f"supply_def_{s}_{t}")
+            model.addConstr(r[s, t] == quicksum(d[n-1] * y[n, s, t] for n in N), name=f"supply_def_{s}_{t}")
 
-        # Capacity with accumulation of reinforcements
         for s in S:
             cap = P[s-1] + R * quicksum(z[s, tau] for tau in years if tau <= t)
             model.addConstr(r[s, t] <= cap * w[s, t], name=f"capacity_{s}_{t}")
 
-        # Feeder line activation if substation is on
         for s in S:
-            model.addConstr(w[s, t] <= quicksum(x[i, j, s, t] for (i, j) in A),
-                            name=f"feeder_{s}_{t}")
+            model.addConstr(w[s, t] <= quicksum(x[i, j, s, t] for (i, j) in A), name=f"feeder_{s}_{t}")
 
-        # Flow conservation
         for s in S:
             for n in N:
                 incoming = quicksum(f[s, j, n, t] for (j, k) in A if k == n)
@@ -342,47 +322,39 @@ def solve_network_intertemporal(Network: DistributionNetwork, R, B, dr, years, d
                 if n == N_S[s-1]:
                     model.addConstr(outgoing - incoming == r[s, t], name=f"flow_balance_sub_{s}_{n}_{t}")
                 elif n in N_NS:
-                    model.addConstr(outgoing - incoming == -d[n-1] * y[n, s, t],
-                                    name=f"flow_balance_{s}_{n}_{t}")
+                    model.addConstr(outgoing - incoming == -d[n-1] * y[n, s, t], name=f"flow_balance_{s}_{n}_{t}")
 
-        # Flow only if arc used
         for s in S:
             for (i, j) in A:
                 model.addConstr(f[s, i, j, t] <= M * x[i, j, s, t], name=f"f_cap_{s}_{i}_{j}_{t}")
-                # Arc use only if edge built
                 e = (min(i, j), max(i, j))
                 model.addConstr(x[i, j, s, t] <= b[e[0], e[1], s, t], name=f"x_le_b_{s}_{i}_{j}_{t}")
 
-        # Radiality and tree size
         for s in S:
             for n in N_NS:
-                model.addConstr(quicksum(x[j, n, s, t] for (j, k) in A if k == n) == y[n, s, t],
-                                name=f"one_parent_{s}_{n}_{t}")
+                model.addConstr(quicksum(x[j, n, s, t] for (j, k) in A if k == n) == y[n, s, t], name=f"one_parent_{s}_{n}_{t}")
             node_idx = N_S[s-1]
-            model.addConstr(quicksum(x[j, node_idx, s, t] for (j, k) in A if k == node_idx) == 0,
-                            name=f"parent_root_{s}_{t}")
+            model.addConstr(quicksum(x[j, node_idx, s, t] for (j, k) in A if k == node_idx) == 0, name=f"parent_root_{s}_{t}")
             for (k, j) in A:
                 if k == node_idx:
-                    model.addConstr(
-                        quicksum(x[k, j, s2, t] for s2 in S if s2 != s) <= (1 - y[node_idx, s, t]),
-                        name=f"root_arc_ass_s{s}_arc{node_idx}_{j}_{t}")
+                    model.addConstr(quicksum(x[k, j, s2, t] for s2 in S if s2 != s) <= (1 - y[node_idx, s, t]),
+                                    name=f"root_arc_ass_s{s}_arc{node_idx}_{j}_{t}")
         for s in S:
-            model.addConstr(quicksum(x[i, j, s, t] for (i, j) in A) ==
-                            quicksum(y[n, s, t] for n in N) - w[s, t],
+            model.addConstr(quicksum(x[i, j, s, t] for (i, j) in A) == quicksum(y[n, s, t] for n in N) - w[s, t],
                             name=f"tree_size_{s}_{t}")
 
-        # Budget per year
+        # Budget per year (nominal)
         budget_t = B[t] if isinstance(B, dict) else B
         fix_term_t = quicksum(C_S[s-1] * w_on[s, t] for s in S)
-        edge_term_t = quicksum(C_L[(i, j)] * b_on[i, j, s, t] for (i, j) in Network.E for s in S)
+        edge_term_t = quicksum(C_L[(i, j)] * b_on[i, j, s, t] for (i, j) in E for s in S)
         reinf_term_t = quicksum(C_R[s-1] * z[s, t] for s in S)
         opex_term_t = op_cost * quicksum(w[s, t] for s in S)
         model.addConstr(fix_term_t + edge_term_t + reinf_term_t + opex_term_t <= budget_t, name=f"budget_{t}")
 
-    # Objective: discounted cost over years
+    # Objective: discounted cost
     objective = quicksum(
         (quicksum(C_S[s-1] * w_on[s, t] for s in S) +
-         quicksum(C_L[(i, j)] * b_on[i, j, s, t] for (i, j) in Network.E for s in S) +
+         quicksum(C_L[(i, j)] * b_on[i, j, s, t] for (i, j) in E for s in S) +
          quicksum(C_R[s-1] * z[s, t] for s in S) +
          op_cost * quicksum(w[s, t] for s in S)) / ((1 + dr) ** (t - 1))
         for t in years
@@ -403,34 +375,30 @@ def solve_network_intertemporal(Network: DistributionNetwork, R, B, dr, years, d
     f_val = {(s, i, j, t): f[s, i, j, t].X for s in S for (i, j) in A for t in years}
     r_val = {(s, t): r[s, t].X for s in S for t in years}
     z_val = {(s, t): z[s, t].X for s in S for t in years}
-    P_val = {(s, t): (P[s-1] + R * sum(z_val[s, tau] for tau in years if tau <= t)) * w_val[s, t]
+    P_val = {(s, t): (P[s-1] + R * sum(z[s, tau].X for tau in years if tau <= t)) * w_val[s, t]
              for s in S for t in years}
-    b_val = {(i, j, s, t): b[i, j, s, t].X for (i, j) in Network.E for s in S for t in years}
-    b_on_val = {(i, j, s, t): b_on[i, j, s, t].X for (i, j) in Network.E for s in S for t in years}
+    b_val = {(i, j, s, t): b[i, j, s, t].X for (i, j) in E for s in S for t in years}
+    b_on_val = {(i, j, s, t): b_on[i, j, s, t].X for (i, j) in E for s in S for t in years}
 
-    # Per-year discounted costs (aligns with objective)
     cost_per_year = {}
     cost_per_year_nominal = {}
     cost_components_nominal = {}
     cost_components_discounted = {}
     for t in years:
         fix_term_t = sum(C_S[s-1] * w_on_val[s, t] for s in S)
-        edge_term_t = sum(C_L[(i, j)] * b_on_val[i, j, s, t] for (i, j) in Network.E for s in S)
+        edge_term_t = sum(C_L[(i, j)] * b_on_val[i, j, s, t] for (i, j) in E for s in S)
         reinf_term_t = sum(C_R[s-1] * z_val[s, t] for s in S)
         opex_t = op_cost * sum(w_val[s, t] for s in S)
-        cost_per_year[t] = (fix_term_t + edge_term_t + reinf_term_t + opex_t) / ((1 + dr) ** (t - 1))
         cost_per_year_nominal[t] = fix_term_t + edge_term_t + reinf_term_t + opex_t
+        cost_per_year[t] = cost_per_year_nominal[t] / ((1 + dr) ** (t - 1))
         cost_components_nominal[t] = {
             "substation": fix_term_t,
             "lines": edge_term_t,
             "reinforcement": reinf_term_t,
-            "opex": opex_t
+            "opex": opex_t,
         }
         cost_components_discounted[t] = {
-            "substation": fix_term_t / ((1 + dr) ** (t - 1)),
-            "lines": edge_term_t / ((1 + dr) ** (t - 1)),
-            "reinforcement": reinf_term_t / ((1 + dr) ** (t - 1)),
-            "opex": opex_t / ((1 + dr) ** (t - 1)),
+            k: v / ((1 + dr) ** (t - 1)) for k, v in cost_components_nominal[t].items()
         }
 
     return {
@@ -456,19 +424,10 @@ def solve_network_intertemporal(Network: DistributionNetwork, R, B, dr, years, d
 # Stochastic (scenario-based) intertemporal model
 # ------------------------------------------------------------
 def solve_network_stochastic(Network: DistributionNetwork, R, B, dr, years, scenarios, op_cost=0.0, reliability_target=1.0, shed_cost=0.0, OutputFlag=0):
-    """Solve a multi-year stochastic expansion model with shared investments and scenario-specific operations.
+    """Stochastic multi-year model (Model 3) with shared investments and scenario ops.
 
-    Args:
-        Network (DistributionNetwork): Base distribution network (static topology and costs).
-        R (float): Size of a single capacity reinforcement.
-        B (float or dict): Annual budget (scalar or dict {t: B_t}).
-        dr (float): Discount rate.
-        years (list[int]): List of year indices.
-        scenarios (dict): Mapping scenario_id -> {'prob': p, 'demands': {t: load_capacity dict}}.
-        OutputFlag (int): Gurobi output flag.
-
-    Returns:
-        dict: objective, per-year costs, decisions, and scenario-specific operations.
+    Budgets include capex, opex, and expected shed cost. Reliability is enforced via
+    a maximum shed fraction (1 - reliability_target).
     """
     O = list(scenarios.keys())
 
@@ -491,9 +450,8 @@ def solve_network_stochastic(Network: DistributionNetwork, R, B, dr, years, scen
     d_to = {}
     for o in O:
         d_to[o] = {}
-        L_map = scenarios[o]['demands']
         for t in years:
-            L = L_map[t]
+            L = scenarios[o]['demands'][t]
             d = np.zeros(len(Network.NODES))
             for load, node in Network.loads_locations.items():
                 ind = int(node[1:]) - 1
@@ -505,25 +463,18 @@ def solve_network_stochastic(Network: DistributionNetwork, R, B, dr, years, scen
     # Investment variables (scenario-invariant)
     w = model.addVars(S, years, vtype=GRB.BINARY, name="w")
     w_on = model.addVars(S, years, vtype=GRB.BINARY, name="w_on")
-    b = model.addVars([(i, j, s, t) for (i, j) in E for s in S for t in years],
-                      vtype=GRB.BINARY, name="b")
-    b_on = model.addVars([(i, j, s, t) for (i, j) in E for s in S for t in years],
-                         vtype=GRB.BINARY, name="b_on")
+    b = model.addVars([(i, j, s, t) for (i, j) in E for s in S for t in years], vtype=GRB.BINARY, name="b")
+    b_on = model.addVars([(i, j, s, t) for (i, j) in E for s in S for t in years], vtype=GRB.BINARY, name="b_on")
     z = model.addVars(S, years, lb=0, vtype=GRB.INTEGER, name="z")
 
-    # Operational variables (scenario-specific)
-    y = model.addVars([(i, s, t, o) for i in N for s in S for t in years for o in O],
-                      vtype=GRB.BINARY, name="y")
-    x = model.addVars([(i, j, s, t, o) for (i, j) in A for s in S for t in years for o in O],
-                      vtype=GRB.BINARY, name="x")
-    f = model.addVars([(s, i, j, t, o) for s in S for (i, j) in A for t in years for o in O],
-                      lb=0.0, vtype=GRB.CONTINUOUS, name="f")
-    r = model.addVars([(s, t, o) for s in S for t in years for o in O],
-                      lb=0.0, vtype=GRB.CONTINUOUS, name="r")
-    ls = model.addVars([(n, t, o) for n in N for t in years for o in O],
-                      lb=0.0, vtype=GRB.CONTINUOUS, name="ls")  # load shedding (reliability)
+    # Operational (scenario-specific)
+    y = model.addVars([(i, s, t, o) for i in N for s in S for t in years for o in O], vtype=GRB.BINARY, name="y")
+    x = model.addVars([(i, j, s, t, o) for (i, j) in A for s in S for t in years for o in O], vtype=GRB.BINARY, name="x")
+    f = model.addVars([(s, i, j, t, o) for s in S for (i, j) in A for t in years for o in O], lb=0.0, vtype=GRB.CONTINUOUS, name="f")
+    r = model.addVars([(s, t, o) for s in S for t in years for o in O], lb=0.0, vtype=GRB.CONTINUOUS, name="r")
+    ls = model.addVars([(n, t, o) for n in N for t in years for o in O], lb=0.0, vtype=GRB.CONTINUOUS, name="ls")
 
-    # Activation monotonicity
+    # Monotone activation
     for s in S:
         first_t = years[0]
         model.addConstr(w_on[s, first_t] == w[s, first_t], name=f"w_on_init_{s}")
@@ -537,7 +488,7 @@ def solve_network_stochastic(Network: DistributionNetwork, R, B, dr, years, scen
             if s in S_0:
                 model.addConstr(w[s, t_cur] == 1, name=f"w_fix_{s}_{t_cur}")
 
-    # Line build monotonicity
+    # Monotone line builds
     for s in S:
         for (i_u, j_u) in E:
             first_t = years[0]
@@ -549,18 +500,14 @@ def solve_network_stochastic(Network: DistributionNetwork, R, B, dr, years, scen
                 model.addConstr(b_on[i_u, j_u, s, t_cur] >= b[i_u, j_u, s, t_cur] - b[i_u, j_u, s, t_prev],
                                 name=f"b_on_diff_{s}_{i_u}_{j_u}_{t_cur}")
 
-    # Scenario-specific constraints
+    # Scenario constraints
     for o in O:
         for t in years:
             d = d_to[o][t]
             M = float(np.sum(d))
 
-            model.addConstr(quicksum(r[s, t, o] for s in S) + quicksum(ls[n, t, o] for n in N) == np.sum(d),
-                            name=f"power_balance_{t}_{o}")
-
-            # Reliability: limit shed to (1 - reliability_target) fraction of demand
-            model.addConstr(quicksum(ls[n, t, o] for n in N) <= (1 - reliability_target) * np.sum(d),
-                            name=f"reliability_{t}_{o}")
+            model.addConstr(quicksum(r[s, t, o] for s in S) + quicksum(ls[n, t, o] for n in N) == np.sum(d), name=f"power_balance_{t}_{o}")
+            model.addConstr(quicksum(ls[n, t, o] for n in N) <= (1 - reliability_target) * np.sum(d), name=f"reliability_{t}_{o}")
             for n in N:
                 model.addConstr(ls[n, t, o] <= d[n-1], name=f"ls_cap_{n}_{t}_{o}")
 
@@ -579,16 +526,14 @@ def solve_network_stochastic(Network: DistributionNetwork, R, B, dr, years, scen
                         model.addConstr(y[node_idx, s2, t, o] == 0, name=f"substation_no_assign_{s}_{s2}_{t}_{o}")
 
             for s in S:
-                model.addConstr(r[s, t, o] == quicksum((d[n-1] - ls[n, t, o]) * y[n, s, t, o] for n in N),
-                                name=f"supply_def_{s}_{t}_{o}")
+                model.addConstr(r[s, t, o] == quicksum((d[n-1] - ls[n, t, o]) * y[n, s, t, o] for n in N), name=f"supply_def_{s}_{t}_{o}")
 
             for s in S:
                 cap = P[s-1] + R * quicksum(z[s, tau] for tau in years if tau <= t)
                 model.addConstr(r[s, t, o] <= cap * w[s, t], name=f"capacity_{s}_{t}_{o}")
 
             for s in S:
-                model.addConstr(w[s, t] <= quicksum(x[i, j, s, t, o] for (i, j) in A),
-                                name=f"feeder_{s}_{t}_{o}")
+                model.addConstr(w[s, t] <= quicksum(x[i, j, s, t, o] for (i, j) in A), name=f"feeder_{s}_{t}_{o}")
 
             for s in S:
                 for n in N:
@@ -597,8 +542,7 @@ def solve_network_stochastic(Network: DistributionNetwork, R, B, dr, years, scen
                     if n == N_S[s-1]:
                         model.addConstr(outgoing - incoming == r[s, t, o], name=f"flow_balance_sub_{s}_{n}_{t}_{o}")
                     elif n in N_NS:
-                        model.addConstr(outgoing - incoming == -(d[n-1] - ls[n, t, o]) * y[n, s, t, o],
-                                        name=f"flow_balance_{s}_{n}_{t}_{o}")
+                        model.addConstr(outgoing - incoming == -(d[n-1] - ls[n, t, o]) * y[n, s, t, o], name=f"flow_balance_{s}_{n}_{t}_{o}")
 
             for s in S:
                 for (i, j) in A:
@@ -608,22 +552,18 @@ def solve_network_stochastic(Network: DistributionNetwork, R, B, dr, years, scen
 
             for s in S:
                 for n in N_NS:
-                    model.addConstr(quicksum(x[j, n, s, t, o] for (j, k) in A if k == n) == y[n, s, t, o],
-                                    name=f"one_parent_{s}_{n}_{t}_{o}")
+                    model.addConstr(quicksum(x[j, n, s, t, o] for (j, k) in A if k == n) == y[n, s, t, o], name=f"one_parent_{s}_{n}_{t}_{o}")
                 node_idx = N_S[s-1]
-                model.addConstr(quicksum(x[j, node_idx, s, t, o] for (j, k) in A if k == node_idx) == 0,
-                                name=f"parent_root_{s}_{t}_{o}")
+                model.addConstr(quicksum(x[j, node_idx, s, t, o] for (j, k) in A if k == node_idx) == 0, name=f"parent_root_{s}_{t}_{o}")
                 for (k, j) in A:
                     if k == node_idx:
-                        model.addConstr(
-                            quicksum(x[k, j, s2, t, o] for s2 in S if s2 != s) <= (1 - y[node_idx, s, t, o]),
-                            name=f"root_arc_ass_s{s}_arc{node_idx}_{j}_{t}_{o}")
+                        model.addConstr(quicksum(x[k, j, s2, t, o] for s2 in S if s2 != s) <= (1 - y[node_idx, s, t, o]),
+                                        name=f"root_arc_ass_s{s}_arc{node_idx}_{j}_{t}_{o}")
             for s in S:
-                model.addConstr(quicksum(x[i, j, s, t, o] for (i, j) in A) ==
-                                quicksum(y[n, s, t, o] for n in N) - w[s, t],
+                model.addConstr(quicksum(x[i, j, s, t, o] for (i, j) in A) == quicksum(y[n, s, t, o] for n in N) - w[s, t],
                                 name=f"tree_size_{s}_{t}_{o}")
 
-    # Budget per year (includes opex and expected shed)
+    # Budget per year (expected nominal)
     for t in years:
         budget_t = B[t] if isinstance(B, dict) else B
         fix_term_t = quicksum(C_S[s-1] * w_on[s, t] for s in S)
@@ -633,14 +573,13 @@ def solve_network_stochastic(Network: DistributionNetwork, R, B, dr, years, scen
         shed_term_t = shed_cost * quicksum(scenarios[o]['prob'] * quicksum(ls[n, t, o] for n in N) for o in O)
         model.addConstr(fix_term_t + edge_term_t + reinf_term_t + opex_term_t + shed_term_t <= budget_t, name=f"budget_{t}")
 
-    # Objective: expected (investments are scenario-invariant so prob factor optional)
+    # Objective: expected discounted cost
     objective = quicksum(
         (quicksum(C_S[s-1] * w_on[s, t] for s in S) +
          quicksum(C_L[(i, j)] * b_on[i, j, s, t] for (i, j) in E for s in S) +
          quicksum(C_R[s-1] * z[s, t] for s in S) +
          op_cost * quicksum(w[s, t] for s in S) +
-         shed_cost * quicksum(scenarios[o]['prob'] * quicksum(ls[n, t, o] for n in N) for o in O)
-         ) / ((1 + dr) ** (t - 1))
+         shed_cost * quicksum(scenarios[o]['prob'] * quicksum(ls[n, t, o] for n in N) for o in O)) / ((1 + dr) ** (t - 1))
         for t in years
     )
     model.setObjective(objective, GRB.MINIMIZE)
@@ -664,8 +603,7 @@ def solve_network_stochastic(Network: DistributionNetwork, R, B, dr, years, scen
     r_val = {(s, t, o): r[s, t, o].X for s in S for t in years for o in O}
     ls_val = {(n, t, o): ls[n, t, o].X for n in N for t in years for o in O}
 
-    P_val = {(s, t): (P[s-1] + R * sum(z_val[s, tau] for tau in years if tau <= t)) * w_val[s, t]
-             for s in S for t in years}
+    P_val = {(s, t): (P[s-1] + R * sum(z_val[s, tau] for tau in years if tau <= t)) * w_val[s, t] for s in S for t in years}
 
     cost_per_year = {}
     cost_per_year_nominal = {}
@@ -677,21 +615,17 @@ def solve_network_stochastic(Network: DistributionNetwork, R, B, dr, years, scen
         reinf_term_t = sum(C_R[s-1] * z_val[s, t] for s in S)
         opex_t = op_cost * sum(w_val[s, t] for s in S)
         shed_t = shed_cost * sum(scenarios[o]['prob'] * sum(ls_val[n, t, o] for n in N) for o in O)
-        cost_per_year[t] = (fix_term_t + edge_term_t + reinf_term_t + opex_t + shed_t) / ((1 + dr) ** (t - 1))
         cost_per_year_nominal[t] = fix_term_t + edge_term_t + reinf_term_t + opex_t + shed_t
+        cost_per_year[t] = cost_per_year_nominal[t] / ((1 + dr) ** (t - 1))
         cost_components_nominal[t] = {
             "substation": fix_term_t,
             "lines": edge_term_t,
             "reinforcement": reinf_term_t,
             "opex": opex_t,
-            "shed": shed_t
+            "shed": shed_t,
         }
         cost_components_discounted[t] = {
-            "substation": fix_term_t / ((1 + dr) ** (t - 1)),
-            "lines": edge_term_t / ((1 + dr) ** (t - 1)),
-            "reinforcement": reinf_term_t / ((1 + dr) ** (t - 1)),
-            "opex": opex_t / ((1 + dr) ** (t - 1)),
-            "shed": shed_t / ((1 + dr) ** (t - 1)),
+            k: v / ((1 + dr) ** (t - 1)) for k, v in cost_components_nominal[t].items()
         }
 
     return {
