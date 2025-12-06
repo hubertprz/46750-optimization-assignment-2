@@ -140,12 +140,12 @@ class DistributionNetwork():
                 if OutputFlag: print("Line disconnected:", (i,j))
                 if i in self.N_S:                                       # ...if it's a substation feeder line -> give it feeder line cost
                     s_ind = self.N_S.index(i)
-                    self.edge_cost[(i,j)] = self.SUBSTATIONS[s_ind].edge_cost
+                    self.edge_cost[(i,j)] = 0.5 * self.SUBSTATIONS[s_ind].edge_cost
                 elif j in self.N_S:
                     s_ind = self.N_S.index(j)
-                    self.edge_cost[(i,j)] = self.SUBSTATIONS[s_ind].edge_cost
+                    self.edge_cost[(i,j)] = 0.5 * self.SUBSTATIONS[s_ind].edge_cost
                 else:                                                   # ... if it's a distribution line -> give it default line_cost.
-                    self.edge_cost[(i,j)] = self.line_cost
+                    self.edge_cost[(i,j)] = 0.5 * self.line_cost
                 
         # --- Reinforced existing substations (increased capacity) ---
         for s, multiplier in z.items():

@@ -4,11 +4,12 @@ from gurobipy import GRB, quicksum
 
 from src.classes import DistributionNetwork
 
-def solve_network(Network: DistributionNetwork, R, B, dr, Y, OutputFlag=0):
+def solve_network(Network: DistributionNetwork, R, B, opex_cost, dr, Y, OutputFlag=0):
     """Solves a Distribution Network expansion problem.
 
     Args:
         Network (DistributionNetwork): Defined Distribution Network.
+        opex_cost (float): Annual operational cost per substation.
         R (float): Size of a single capacity reinforcement.
         B (float): Annual budget (nominal value).
         dr (float): Discount rate.
@@ -47,6 +48,7 @@ def solve_network(Network: DistributionNetwork, R, B, dr, Y, OutputFlag=0):
     C_S = [s.fix_cost for s in Network.SUBSTATIONS]     # Cost of activating substation s
     C_L = Network.edge_cost                             # Cost of connecting line (i,j)
     C_R = [s.r_cost for s in Network.SUBSTATIONS]       # Cost of capacity reinforcement
+    C_OPEX = opex_cost
     # R from the function arguments                     # Size of a single capacity reinforcement
     # B ...                                             # Annual budget
     # dr ...                                            # Discount rate
@@ -63,44 +65,44 @@ def solve_network(Network: DistributionNetwork, R, B, dr, Y, OutputFlag=0):
 
     #   Model. Constraints
     #   (1) Power balance
-    #   All power flows sum up to total system demand (100% covered)
+    #   All power flows sum up to total system demand (100% covered).
     model.addConstr(quicksum(r[s] for s in S) == np.sum(d), name="power_balance")
 
     #   (2 ) Node Assignment
-    #   Node assigned to a substation y[n,s] = 1 only if substation is active w[s] = 1
+    #   Node assigned to a substation y[n,s] = 1 only if substation is active w[s] = 1.
     for n in N:
         for s in S:
             model.addConstr(y[n,s] <= w[s], name=f"y_le_w_{n}_{s}")
 
     #   (2a) Non-substation nodes
-    #   Non-substation node must be assigned to one, and only one, substation
+    #   Non-substation node must be assigned to one, and only one, substation.
     for n in N_NS:
         model.addConstr(quicksum(y[n,s] for s in S) == 1, name=f"assign_{n}")
 
     #   (2b) Substation nodes
-    #   Substation node assignment: assigned to self (if activated)
+    #   Substation node assignment: assigned to self (if activated).
     for s in S:
         node_idx = N_S[s-1]
         model.addConstr(y[node_idx,s] == w[s], name=f"substation_assign_{s}")
-        # Substation nodes cannot be assigned to other substations
+        # Substation nodes cannot be assigned to other substations.
         for s2 in S:
             if s2 != s:
                 model.addConstr(y[node_idx,s2] == 0, name=f"substation_no_assign_{s}_{s2}")
 
     #   (3) Substation supply
-    #   Power flow from a substation is equal to demands supplied by this substation
+    #   Power flow from a substation is equal to demands supplied by this substation.
     for s in S:
         model.addConstr(r[s] == quicksum(d[n-1]*y[n,s] for n in N), name=f"supply_def_{s}")
 
     #   (4) Capacity constraint
-    #   Power flow from a substation lower or equal to substation's max capacity + potential capacity reinforcements
+    #   Power flow from a substation lower or equal to substation's max capacity + potential capacity reinforcements.
     for s in S:
         model.addConstr(r[s] <= (P[s-1] + R * z[s]) * w[s], name=f"capacity_{s}")
 
     #   (5 ) Substation Feeder Line
     #   (5a) Activation - optional, i think it makes sense
-    #   If a substation is activated, at least one feeder line is always used by flows from it
-    #   In practice: You can't fully disconnect a substation once it is activated
+    #   If a substation is activated, at least one feeder line is always used by flows from it.
+    #   In practice: You can't fully disconnect a substation once it is activated.
     #   Now activating a substation can constraint future developments, so multi-period
     #   optimization becomes more valuable.
     for s in S:
@@ -117,49 +119,50 @@ def solve_network(Network: DistributionNetwork, R, B, dr, Y, OutputFlag=0):
                 model.addConstr(outgoing - incoming == -d[n-1]*y[n,s], name=f"flow_balance_{s}_{n}")
 
     #   (7) Flow only if arc assigned
-    #   Flow through arc is costrained by total system demand. Equal to zero if arc is inactive 
+    #   Flow through arc is costrained by total system demand. Equal to zero if arc is inactive.
     for s in S:
         for (i,j) in A:
             model.addConstr(f[s,i,j] <= M*x[i,j,s], name=f"f_cap_{s}_{i}_{j}")
 
     #   (8) Radiality
-    #   Each non-substation node has exactly one parent per assigned substation (1)
+    #   Each non-substation node has exactly one parent per assigned substation (1).
     for s in S:
         for n in N_NS:
             model.addConstr(quicksum(x[j,n,s] for (j,k) in A if k==n) == y[n,s], name=f"one_parent_{s}_{n}")
 
-        # Substation node has no parent (no flows INTO substation node) (2)
+        # Substation node has no parent (no flows INTO substation node) (2).
         node_idx = N_S[s-1]
         model.addConstr(quicksum(x[j,node_idx,s] for (j,k) in A if k==node_idx) == 0, name=f"parent_root_{s}")
 
-        # Substation node n_s assigned to the substation s forbids other substations from using outgoing arcs from n_s (3)
+        # Substation node n_s assigned to the substation s forbids other substations from using outgoing arcs from n_s (3).
         for (k, j) in A:
             if k == node_idx:
                 model.addConstr(
                     quicksum(x[k, j, s2] for s2 in S if s2 != s) <= (1 - y[node_idx, s]),
                     name=f"root_arc_ass_s{s}_arc{node_idx}_{j}")
 
-    #   (9) Tree size: arcs = nodes assigned - w[s]
+    #   (9) Tree size
     for s in S:
         model.addConstr(quicksum(x[i,j,s] for (i,j) in A) == quicksum(y[n,s] for n in N) - w[s], name=f"tree_size_{s}")
 
     #   (10 ) Initial Constraints
     #   Existing substations activation
-    #   EXISTING substations must stay active. (Looks for substations with ZERO FIXED COST)
+    #   Existing substations must stay active. (Looks for substations with ZERO FIXED COST)
     for s in S_0:
         model.addConstr(w[s] == 1, name="w_act_{s}")
 
     #   (11) Annual budget costraint
-    #   Total cost cannot exceed annual budget
+    #   Total cost cannot exceed annual budget.
     fix_term = quicksum(C_S[s-1] * w[s] for s in S)
     edge_term = quicksum(C_L[(min(i,j),max(i,j))] * x[i,j,s] for (i,j) in A for s in S)
     reinf_term = quicksum(C_R[s-1] * z[s] for s in S)
-    model.addConstr(fix_term + edge_term + reinf_term <= B, name=f"budget_{Y}") # Nominal prices
+    opex_term = quicksum(w[s] * C_OPEX for s in S)
+    model.addConstr(fix_term + edge_term + reinf_term + opex_term <= B, name=f"budget_{Y}") # Nominal prices
 
     #   Model. Objective function
-    #   min f(x) = substation cost + feeder cost + capacity reinforcement cost
+    #   min f(x) = substation cost + feeder cost + capacity reinforcement cost + OPEX
 
-    model.setObjective((fix_term + edge_term + reinf_term)/(1+dr)**(Y-1), GRB.MINIMIZE)
+    model.setObjective((fix_term + edge_term + reinf_term + opex_term)/(1+dr)**(Y-1), GRB.MINIMIZE)
 
     # ------------------------
     #   Solve
@@ -173,7 +176,8 @@ def solve_network(Network: DistributionNetwork, R, B, dr, Y, OutputFlag=0):
     else:
         cost_val = (sum(C_S[s-1] * w[s].X for s in S) 
                     + sum(C_L[(min(i,j), max(i,j))] * x[i,j,s].X for (i,j) in A for s in S)
-                    + sum(C_R[s-1] * z[s].X for s in S))
+                    + sum(C_R[s-1] * z[s].X for s in S)
+                    + sum (w[s].X * C_OPEX for s in S))
         w_val = {s: w[s].X for s in S}
         y_val = {(i, s): y[i, s].X for i in N for s in S}
         x_val = {(i, j, s): x[i, j, s].X for (i, j) in A for s in S}
